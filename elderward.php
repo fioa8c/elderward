@@ -504,6 +504,11 @@ function clean_file($file_buffer, $file_path, $signature_array)
             }
             if ( $action[0] === "DELETE_FILE" )
             {
+                // Dry run: report the deletion without touching the file.
+                if ( isset($_GET['dryrun']) )
+                {
+                    return("WOULD_CLEAR," . $file_path . "," . $signature['name'] . "\n");
+                }
                 if (unlink($file_path) === false) {
                     echo 'Error deleting ' . $file_path .' with signature '. $signature['name'] . "\n";
                     return (false);
