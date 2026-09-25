@@ -47,6 +47,26 @@ if (! isset($_GET['scandirectory'])) {
 
 }
 
+////////////
+// Usage / help screen
+///////////
+if (isset($_GET['help'])) {
+    echo "Elderward - malware scanner and cleanup utility\n";
+    echo "\n";
+    echo "Usage (CLI):  php elderward.php [option=value ...]\n";
+    echo "Usage (web):  elderward.php?token=...&option=value  (requires WEB_ACCESS_TOKEN to be set)\n";
+    echo "\n";
+    echo "Options:\n";
+    echo "  scandirectory=/path   Directory to scan for malware (default: current directory)\n";
+    echo "  scan_all=1            Scan every file, not just known-risky extensions\n";
+    echo "  dryrun=1              Report what would be cleaned without writing any file\n";
+    echo "  scancron=1            Scan the current user's crontab for known malicious entries\n";
+    echo "  scanlog=/path         Scan an access log (file or directory of logs, .gz supported)\n";
+    echo "                        for known indicators of compromise, then exit\n";
+    echo "  help=1                Show this help\n";
+    die();
+}
+
 function write_cleaned_file($file_path, $cleaned_conent)
 {
     // Write to a temp file and rename over the target so the original is never
@@ -162,6 +182,239 @@ function scanCronTab()
                 }
             }
         }
+    }
+}
+
+///////////////
+// Access log IoC signatures.
+// Each signature matches one line of a common/combined format access log.
+// "threshold" hides findings until that many hits are seen: a single POST to
+// wp-login.php is normal traffic, five hundred of them is a brute force.
+//////////////
+$ACCESS_LOG_SIGS = array(
+    array(
+        'name'        => 'access.uploads.php',
+        'pattern'     => '@"(?:GET|POST|HEAD) /[^"\s]*wp-content/uploads/[^"\s]*\.ph(?:p[34578]?|tml|ps|t)\b@i',
+        'threshold'   => 1,
+        'description' => 'PHP file requested inside wp-content/uploads. Uploads should never contain executable PHP; this is usually a webshell dropped through an upload form.',
+    ),
+    array(
+        'name'        => 'access.webshell.names',
+        'pattern'     => '@"(?:GET|POST|HEAD) /[^"\s]*(?:wso\d*|filesman|alfa(?:-rex|_data)?|b374k|c99(?:shell)?|r57|indoxploit|mini_?shell|webshell|priv8)[^"\s]*\.ph@i',
+        'threshold'   => 1,
+        'description' => 'Request to a well-known webshell filename (WSO, FilesMan, AlfaShell, c99, r57, ...).',
+    ),
+    array(
+        'name'        => 'access.adminer',
+        'pattern'     => '@"(?:GET|POST) /[^"\s]*adminer[^"\s]*\.php@i',
+        'threshold'   => 1,
+        'description' => 'Request to an Adminer database client. Attackers drop it to reuse the credentials from wp-config.php against the database.',
+    ),
+    array(
+        'name'        => 'access.wp-file-manager.rce',
+        'pattern'     => '@wp-file-manager/lib/php/connector\.minimal\.php@i',
+        'threshold'   => 1,
+        'description' => 'Request to wp-file-manager connector.minimal.php, exploited for unauthenticated file upload (CVE-2020-25213).',
+    ),
+    array(
+        'name'        => 'access.revslider',
+        'pattern'     => '@admin-ajax\.php\?[^"\s]*action=revslider@i',
+        'threshold'   => 1,
+        'description' => 'Slider Revolution admin-ajax action, exploited for arbitrary file download/upload in old plugin versions.',
+    ),
+    array(
+        'name'        => 'access.timthumb',
+        'pattern'     => '@timthumb\.php\?[^"\s]*src=https?@i',
+        'threshold'   => 1,
+        'description' => 'TimThumb remote-source request, exploited for remote file inclusion in old theme bundles.',
+    ),
+    array(
+        'name'        => 'access.setup-config',
+        'pattern'     => '@"(?:GET|POST) /[^"\s]*wp-admin/(?:setup-config|install)\.php@i',
+        'threshold'   => 1,
+        'description' => 'Access to the WordPress installer/setup-config, used to take over half-finished or broken installs.',
+    ),
+    array(
+        'name'        => 'access.env.probe',
+        'pattern'     => '@"(?:GET|POST) /[^"\s]*\.env(?:\.\w+)?["\s]@i',
+        'threshold'   => 1,
+        'description' => 'Probe for a .env file, hunting for exposed credentials.',
+    ),
+    array(
+        'name'        => 'access.traversal',
+        'pattern'     => '@"(?:GET|POST|HEAD) /[^"]*\.\./\.\./@',
+        'threshold'   => 1,
+        'description' => 'Directory traversal attempt (../../) in the request path or query string.',
+    ),
+    array(
+        'name'        => 'access.query.code-injection',
+        'pattern'     => '@"(?:GET|POST) /[^"]*(?:eval\(|base64_decode|gzinflate|call_user_func|assert\()@i',
+        'threshold'   => 1,
+        'description' => 'PHP code passed in the request, a code injection attempt against a vulnerable plugin or theme.',
+    ),
+    array(
+        'name'        => 'access.query.php-ini-injection',
+        'pattern'     => '@(?:auto_prepend_file|allow_url_include|disable_functions)=@i',
+        'threshold'   => 1,
+        'description' => 'php.ini directives in the query string, a PHP-CGI argument injection attempt (CVE-2012-1823 / CVE-2024-4577).',
+    ),
+    array(
+        'name'        => 'access.user.enumeration',
+        'pattern'     => '@"GET /[^"\s]*(?:wp-json/wp/v2/users|\?author=\d)@i',
+        'threshold'   => 10,
+        'description' => 'Username enumeration through the REST API or ?author= redirects, usually reconnaissance before a brute force.',
+    ),
+    array(
+        'name'        => 'access.xmlrpc.flood',
+        'pattern'     => '@"POST /[^"\s]*xmlrpc\.php@i',
+        'threshold'   => 50,
+        'description' => 'High volume of xmlrpc.php POSTs, typically credential brute forcing via system.multicall or pingback abuse.',
+    ),
+    array(
+        'name'        => 'access.wp-login.bruteforce',
+        'pattern'     => '@"POST /[^"\s]*wp-login\.php@i',
+        'threshold'   => 50,
+        'description' => 'High volume of wp-login.php POSTs, a login brute force.',
+    ),
+);
+
+function scanAccessLog($log_path)
+{
+    global $ACCESS_LOG_SIGS;
+
+    ///////////////
+    // Logs are streamed line by line (never loaded whole) so rotated
+    // multi-hundred-MB logs stay within the memory limit. Gzipped
+    // rotations are read through zlib when available.
+    //////////////
+    $is_gzipped = ('gz' === strtolower(pathinfo($log_path, PATHINFO_EXTENSION)));
+    if ($is_gzipped && !function_exists('gzopen')) {
+        echo 'Error: zlib not available, skipping compressed log ' . $log_path . "\n";
+        return;
+    }
+
+    $fh = $is_gzipped ? @gzopen($log_path, 'r') : @fopen($log_path, 'r');
+    if (false === $fh) {
+        echo 'Error reading ' . $log_path . "\n";
+        return;
+    }
+
+    $max_examples = 5;
+    $max_example_length = 300;
+    $hit_counts = array();
+    $hit_examples = array();
+    $hit_ips = array();
+
+    while (true) {
+        // 8KB cap per read: an absurdly long line is scanned in chunks
+        // instead of ballooning memory.
+        $line = $is_gzipped ? gzgets($fh, 8192) : fgets($fh, 8192);
+        if (false === $line) {
+            break;
+        }
+
+        foreach ($ACCESS_LOG_SIGS as $signature) {
+            // Only an explicit 1 counts as a match; false (engine error) must not flag.
+            if (preg_match($signature['pattern'], $line) !== 1) {
+                continue;
+            }
+
+            $name = $signature['name'];
+            $hit_counts[$name] = isset($hit_counts[$name]) ? $hit_counts[$name] + 1 : 1;
+
+            if (!isset($hit_examples[$name])) {
+                $hit_examples[$name] = array();
+                $hit_ips[$name] = array();
+            }
+            if (count($hit_examples[$name]) < $max_examples) {
+                $hit_examples[$name][] = substr(trim($line), 0, $max_example_length);
+            }
+
+            // Common/combined log lines start with the client IP.
+            $ip = strtok(trim($line), ' ');
+            if (false !== filter_var($ip, FILTER_VALIDATE_IP)) {
+                $hit_ips[$name][$ip] = isset($hit_ips[$name][$ip]) ? $hit_ips[$name][$ip] + 1 : 1;
+            }
+
+            // First matching IoC wins for this line.
+            break;
+        }
+    }
+    $is_gzipped ? gzclose($fh) : fclose($fh);
+
+    ///////////////
+    // Report: every signature at or over its threshold, with example lines,
+    // then the source IPs behind the reported hits.
+    //////////////
+    echo "== Access log IoC report: " . $log_path . " ==\n";
+
+    $reported = 0;
+    $reported_ips = array();
+    foreach ($ACCESS_LOG_SIGS as $signature) {
+        $name = $signature['name'];
+        if (!isset($hit_counts[$name]) || $hit_counts[$name] < $signature['threshold']) {
+            continue;
+        }
+        $reported++;
+
+        echo "LOG_IOC," . $name . "," . $hit_counts[$name] . " hit(s)\n";
+        echo "    " . $signature['description'] . "\n";
+        foreach ($hit_examples[$name] as $example) {
+            echo "    e.g. " . $example . "\n";
+        }
+
+        foreach ($hit_ips[$name] as $ip => $count) {
+            $reported_ips[$ip] = isset($reported_ips[$ip]) ? $reported_ips[$ip] + $count : $count;
+        }
+    }
+
+    if (0 === $reported) {
+        echo "No known IoCs found.\n";
+        return;
+    }
+
+    arsort($reported_ips);
+    echo "Top source IPs on flagged requests:\n";
+    foreach (array_slice($reported_ips, 0, 10, true) as $ip => $count) {
+        echo "    " . $ip . " (" . $count . " hits)\n";
+    }
+}
+
+function scanLogTarget($target)
+{
+    if (is_file($target)) {
+        scanAccessLog($target);
+        return;
+    }
+
+    if (!is_dir($target) || !is_readable($target)) {
+        echo 'Error: cannot open log target ' . $target . "\n";
+        exit(1);
+    }
+
+    ///////////////
+    // A directory target scans everything in it that looks like an access
+    // log (access*, *.log, rotated *.log.N and *.log.N.gz). Error logs have
+    // a different format and are skipped.
+    //////////////
+    $dir = new RecursiveDirectoryIterator($target, RecursiveDirectoryIterator::SKIP_DOTS);
+    $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+
+    $logs_found = 0;
+    foreach ($files as $file) {
+        $basename = $file->getFilename();
+        if (preg_match('@error@i', $basename)) {
+            continue;
+        }
+        if (preg_match('@(?:access[^/]*|\.log(?:\.\d+)?(?:\.gz)?)$@i', $basename) !== 1) {
+            continue;
+        }
+        scanAccessLog($file->getPathname());
+        $logs_found++;
+    }
+
+    if (0 === $logs_found) {
+        echo 'No access log files found in ' . $target . "\n";
     }
 }
 
@@ -306,6 +559,20 @@ function cleanup_util($file_buffer, $file_path)
 }
 
 ////////////
+// Standalone scan modes: neither needs a scan directory, so they run and
+// exit before the directory validation below.
+///////////
+if ( isset($_GET['scancron']) ) {
+    scanCronTab();
+    die();
+}
+
+if ( isset($_GET['scanlog']) ) {
+    scanLogTarget($_GET['scanlog']);
+    die();
+}
+
+////////////
 // using RecursiveDirectoryIterator and RecursiveIteratorIterator to crawl the directories
 // using SKIP_DOTS because it's not important
 ///////////
@@ -360,11 +627,6 @@ $extensions_to_check = array(
     'tmpl',
     'tpl',
 );
-
-if ( isset($_GET['scancron']) ) {
-    scanCronTab();
-    die();
-}
 
 ///////////
 // iterating through the files collected
