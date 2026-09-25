@@ -53,6 +53,29 @@ Delete the file from the server when you're done.
 - **Crontab** — known persistence patterns (piped base64 decoders, pastebin downloads, tmp-dir droppers).
 - **Access logs** — known attack traffic: webshell requests, PHP files served from `wp-content/uploads`, wp-file-manager / Slider Revolution / TimThumb exploit attempts, `.env` probes, directory traversal, code and PHP-CGI injection, user enumeration, and xmlrpc/wp-login brute-force floods.
 
+## Adding signatures
+
+File cleanup signatures live in `$CLEANUP_SIGNATURES`, keyed by a unique name:
+
+```php
+'javascript_example' => array(
+    // Cheap check run first on every file: array('string' => needle) for a
+    // fast strpos lookup (preferred), or array('regex' => pattern).
+    'prefilter' => array('string' => 'example-malware-marker'),
+    // Zero or more further conditions that must ALL also match. The
+    // prefilter already counts, so don't repeat it here.
+    'triggers'  => array(
+        array('regex' => '/eval\(example_\w+\(/'),
+    ),
+    // What to do with a confirmed file: remove every match of a pattern,
+    // or delete the file outright.
+    'action'    => array('remove_regex' => '/eval\(example_\w+\([^;]+;/s'),
+    // 'action' => array('delete_file' => true),
+),
+```
+
+Regexes are full PCRE patterns with delimiters and flags. Every pattern (including the crontab and access log sets) is compile-checked at startup, so a malformed regex stops the run and names the broken signature instead of silently never matching. `remove_regex` fails loudly if it matched nothing, and `dryrun=1` covers both action types.
+
 ## Limitations
 
 - Signature-based: it finds and removes *known* malware. A clean scan is not proof of a clean site.

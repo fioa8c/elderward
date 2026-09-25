@@ -97,42 +97,47 @@ function write_cleaned_file($file_path, $cleaned_conent)
 
 
 ////////////////
-// Adding a custom signature 
+// Cleanup signatures.
+//
+// Each entry is keyed by a unique signature name and holds:
+//
+//   'prefilter'  One cheap condition, checked first on every file. It counts
+//                as confirmed evidence, so it does not need to be repeated
+//                in the triggers.
+//   'triggers'   Zero or more further conditions that must ALL also match
+//                before the file is considered infected.
+//   'action'     What to do with a confirmed file.
+//
+// A condition is array('string' => needle) (fast strpos lookup, preferred
+// for the prefilter) or array('regex' => pattern). Regexes are full PCRE
+// patterns: bring your own delimiters and flags.
+//
+// Actions:
+//   array('remove_regex' => pattern)   Delete every match of the pattern
+//                                      from the file. Fails (and reports)
+//                                      if nothing was removed.
+//   array('delete_file' => true)       Delete the whole file.
+//
+// Every pattern is compile-checked at startup, so a malformed regex stops
+// the run with the signature's name instead of silently never matching.
 //////////////
 
 
-$CLEANUP_RULES = array(
-    "signatures" => array(
-            ////// This means that signatures don't have a pre-filter.
-            
-            ////NESTING with array key
-            "/if\((typeof)?\s*nds.===.?undefined.?\)/" => array( "NESTING_REGEX",
-                array(
-                    "name" => "javascript_ndsw",
-                    "triggers" => array(
-                            array("REGEX_ALL", "/if\((typeof)?\s*nds.===.?undefined.?\)/"),
-                            array("REGEX_ALL","/\w\s*=\s*parseInt\(\w\(\w\.\w\)\)\s*\/\s*[\dx]+\s*[\+\s*\-]+\s*parseInt\(\w\(\w\.\w\)\)\s*\/\s*[\dx]+\s*[\+\s*\-]+\s*/"),
-                    ),
-                    "actions" => array(
-                            array("REGEX_CLEANUP", "if\((typeof)?\s*nds.===.?undefined.?\)[^#]+return\s*A\s*\(\s*\)\s*;?\s*}\s*}\s*;?")
-                    ),
-                    "filenameRegex" => "",
-                ),
-            ),
-            "/if\((typeof)?\s*wqpq\s*===.?undefined.?\)/" => array( "NESTING_REGEX",
-                array(
-                    "name" => "javascript_wqpq",
-                    "triggers" => array(
-                            array("REGEX_ALL", "/if\((typeof)?\s*wqpq\s*===.?undefined.?\)/"),
-                            array("REGEX_ALL","/try{var\s*\w\s*=\s*\-?parseInt\(\w\(0x\d+,\s*.\w+/"),
-                    ),
-                    "actions" => array(
-                            array("REGEX_CLEANUP", "if\((typeof)?\s*\w+.?===.?undefined.?\)[^\n]+;\s*\}\s*\}\s*\(\s*\)\s*\);\s*\};")
-                    ),
-                    "filenameRegex" => "",
-                ),
-            ),
-  ),
+$CLEANUP_SIGNATURES = array(
+    'javascript_ndsw' => array(
+        'prefilter' => array('regex' => '/if\((typeof)?\s*nds.===.?undefined.?\)/'),
+        'triggers'  => array(
+            array('regex' => '/\w\s*=\s*parseInt\(\w\(\w\.\w\)\)\s*\/\s*[\dx]+\s*[\+\s*\-]+\s*parseInt\(\w\(\w\.\w\)\)\s*\/\s*[\dx]+\s*[\+\s*\-]+\s*/'),
+        ),
+        'action'    => array('remove_regex' => '/if\((typeof)?\s*nds.===.?undefined.?\)[^#]+return\s*A\s*\(\s*\)\s*;?\s*}\s*}\s*;?/s'),
+    ),
+    'javascript_wqpq' => array(
+        'prefilter' => array('regex' => '/if\((typeof)?\s*wqpq\s*===.?undefined.?\)/'),
+        'triggers'  => array(
+            array('regex' => '/try{var\s*\w\s*=\s*\-?parseInt\(\w\(0x\d+,\s*.\w+/'),
+        ),
+        'action'    => array('remove_regex' => '/if\((typeof)?\s*\w+.?===.?undefined.?\)[^\n]+;\s*\}\s*\}\s*\(\s*\)\s*\);\s*\};/s'),
+    ),
 );
 
 
@@ -418,150 +423,165 @@ function scanLogTarget($target)
     }
 }
 
-function check_file($file_buffer, $file_path, $signature_array)
+function pattern_matches($condition, $file_buffer)
 {
-    foreach ( $signature_array as $signature )
+    // A condition is array('string' => needle) or array('regex' => pattern).
+    if ( isset($condition['string']) )
     {
-        if ( false === is_array($signature) )
-        {
-            continue;
-        }
-        // No triggers means nothing can confirm the pre-filter hit: fail closed.
-        if ( empty($signature['triggers']) )
-        {
-            continue;
-        }
-
-        // ALL triggers must match to confirm. An unknown trigger type can never
-        // match, so a typo'd tag fails the signature instead of being skipped.
-        $all_triggers_matched = true;
-        foreach ( $signature['triggers'] as $trigger )
-        {
-            if ( $trigger[0] === "STRING_ALL" )
-            {
-                $trigger_matched = (false !== strpos($file_buffer, $trigger[1]));
-            }
-            elseif ( $trigger[0] === "REGEX_ALL" )
-            {
-                // preg_match returns false on engine errors (e.g. backtrack limit);
-                // only an explicit 1 counts as a match so errors never flag a file.
-                $trigger_matched = (preg_match($trigger[1], $file_buffer) === 1);
-            }
-            else
-            {
-                $trigger_matched = false;
-            }
-
-            if ( !$trigger_matched )
-            {
-                $all_triggers_matched = false;
-                break;
-            }
-        }
-
-        if ( $all_triggers_matched )
-        {
-            return(true);
-        }
+        return (false !== strpos($file_buffer, $condition['string']));
     }
-    return(false);
+    if ( isset($condition['regex']) )
+    {
+        // preg_match returns false on engine errors (e.g. backtrack limit);
+        // only an explicit 1 counts as a match so errors never flag a file.
+        return (preg_match($condition['regex'], $file_buffer) === 1);
+    }
+    // Unknown condition types never match, so a typo'd signature fails
+    // closed instead of flagging files.
+    return (false);
 }
 
-function clean_file($file_buffer, $file_path, $signature_array)
+function signature_matches($file_buffer, $signature)
 {
-
-    foreach ( $signature_array as $signature ) 
+    // The prefilter is the cheap first check and counts as confirmed
+    // evidence; every additional trigger must ALSO match.
+    if ( !pattern_matches($signature['prefilter'], $file_buffer) )
     {
-        if ( false === is_array($signature) )
+        return (false);
+    }
+    foreach ( $signature['triggers'] as $trigger )
+    {
+        if ( !pattern_matches($trigger, $file_buffer) )
         {
-            continue;
+            return (false);
         }
+    }
+    return (true);
+}
 
-        foreach ( $signature['actions'] as $action )
+function apply_action($file_buffer, $file_path, $signature_name, $action)
+{
+    if ( isset($action['remove_regex']) )
+    {
+        // $file_buffer already holds the whole file: files larger than
+        // the read cap are skipped before ever being scanned.
+        $cleared_file = preg_replace($action['remove_regex'], '', $file_buffer);
+        if ( $cleared_file === null || ( strlen($file_buffer) === strlen($cleared_file) ) )
         {
-            if ( $action[0] === "REGEX_CLEANUP" )
-            {
-                // $file_buffer already holds the whole file: files larger than
-                // the read cap are skipped before ever being scanned.
-                $cleared_file = preg_replace('/' . $action[1]. '/s', '', $file_buffer);
-                if ( $cleared_file === null || ( strlen($file_buffer) === strlen($cleared_file) ) )
-                {
-                   echo 'Error cleaning ' . $file_path .' with signature '. $signature['name'] . "," . $action[1]."\n";
-                   return(false);
-                }
-                // Dry run: the cleanup regex was applied and verified to change
-                // the file, but nothing is written.
-                if ( isset($_GET['dryrun']) )
-                {
-                    return("WOULD_CLEAR," . $file_path . "," . $signature['name'] . "\n");
-                }
-                if ( !write_cleaned_file($file_path, $cleared_file) )
-                {
-                   echo 'Error writing cleaned content to ' . $file_path .' with signature '. $signature['name'] . "\n";
-                   return(false);
-                }
-                return("CLEARED," . $file_path . "," . $signature['name'] . "\n");
-            }
-            if ( $action[0] === "DELETE_FILE" )
-            {
-                // Dry run: report the deletion without touching the file.
-                if ( isset($_GET['dryrun']) )
-                {
-                    return("WOULD_CLEAR," . $file_path . "," . $signature['name'] . "\n");
-                }
-                if (unlink($file_path) === false) {
-                    echo 'Error deleting ' . $file_path .' with signature '. $signature['name'] . "\n";
-                    return (false);
-                }
-                return ("CLEARED," . $file_path . "," . $signature['name'] . "\n");
-            }
-
+            echo 'Error cleaning ' . $file_path . ' with signature ' . $signature_name . ',' . $action['remove_regex'] . "\n";
+            return;
         }
-    } 
+        // Dry run: the cleanup regex was applied and verified to change
+        // the file, but nothing is written or deleted.
+        if ( isset($_GET['dryrun']) )
+        {
+            echo "WOULD_CLEAR," . $file_path . "," . $signature_name . "\n";
+            return;
+        }
+        if ( !write_cleaned_file($file_path, $cleared_file) )
+        {
+            echo 'Error writing cleaned content to ' . $file_path . ' with signature ' . $signature_name . "\n";
+            return;
+        }
+        echo "CLEARED," . $file_path . "," . $signature_name . "\n";
+        return;
+    }
+
+    if ( isset($action['delete_file']) )
+    {
+        if ( isset($_GET['dryrun']) )
+        {
+            echo "WOULD_CLEAR," . $file_path . "," . $signature_name . "\n";
+            return;
+        }
+        if ( false === unlink($file_path) )
+        {
+            echo 'Error deleting ' . $file_path . ' with signature ' . $signature_name . "\n";
+            return;
+        }
+        echo "CLEARED," . $file_path . "," . $signature_name . "\n";
+        return;
+    }
+
+    echo 'Error: unknown action for signature ' . $signature_name . "\n";
 }
 
 function cleanup_util($file_buffer, $file_path)
 {
-    global $CLEANUP_RULES;
-    foreach ( $CLEANUP_RULES as $signature_array ) {
-      ///////////////
-      // Loop through the signature nesting and stop on the first confirmed match
-      //////////////
-      foreach ($signature_array as $key => $signature)
-      {
-            // The array key is the cheap pre-filter; only a hit is worth
-            // the full trigger evaluation in check_file().
-            if ( $signature[0] === "NESTING_STRING" )
-            {
-                $pre_filter_hit = (false !== strpos($file_buffer, $key));
-            }
-            elseif ( $signature[0] === "NESTING_REGEX" )
-            {
-                // Only an explicit 1 counts as a match; false (engine error) must not flag.
-                $pre_filter_hit = (preg_match($key, $file_buffer) === 1);
-            }
-            else
-            {
-                continue;
-            }
+    global $CLEANUP_SIGNATURES;
 
-            if ( !$pre_filter_hit || false === check_file($file_buffer, $file_path, $signature) )
-            {
-                continue;
-            }
-
-            ////////////////
-            // Confirmed match: attempt to clean the file, then stop.
-            //////////////
-            $cleanup_result = clean_file($file_buffer, $file_path, $signature);
-            if ( false !== $cleanup_result )
-            {
-                echo $cleanup_result;
-            }
+    ///////////////
+    // First confirmed signature wins: apply its action, then stop.
+    //////////////
+    foreach ( $CLEANUP_SIGNATURES as $signature_name => $signature )
+    {
+        if ( signature_matches($file_buffer, $signature) )
+        {
+            apply_action($file_buffer, $file_path, $signature_name, $signature['action']);
             return;
-      }
+        }
     }
 }
+
+function lint_signatures()
+{
+    global $CLEANUP_SIGNATURES, $CRONTAB_SIGS, $ACCESS_LOG_SIGS;
+
+    ///////////////
+    // A malformed signature would otherwise silently never match. Stop the
+    // run and name the broken signature instead.
+    //////////////
+    foreach ( $CLEANUP_SIGNATURES as $name => $signature )
+    {
+        if ( !isset($signature['prefilter'], $signature['triggers'], $signature['action']) )
+        {
+            echo 'Invalid cleanup signature ' . $name . ": prefilter, triggers and action are required\n";
+            exit(1);
+        }
+
+        $conditions = array_merge(array($signature['prefilter'], $signature['action']), $signature['triggers']);
+        foreach ( $conditions as $condition )
+        {
+            $pattern = null;
+            if ( isset($condition['regex']) )
+            {
+                $pattern = $condition['regex'];
+            }
+            elseif ( isset($condition['remove_regex']) )
+            {
+                $pattern = $condition['remove_regex'];
+            }
+            if ( null !== $pattern && false === @preg_match($pattern, '') )
+            {
+                echo 'Invalid regex in cleanup signature ' . $name . ': ' . $pattern . "\n";
+                exit(1);
+            }
+        }
+    }
+
+    foreach ( $CRONTAB_SIGS as $item )
+    {
+        foreach ( $item as $name => $pattern )
+        {
+            if ( false === @preg_match($pattern, '') )
+            {
+                echo 'Invalid regex in crontab signature ' . $name . ': ' . $pattern . "\n";
+                exit(1);
+            }
+        }
+    }
+
+    foreach ( $ACCESS_LOG_SIGS as $signature )
+    {
+        if ( false === @preg_match($signature['pattern'], '') )
+        {
+            echo 'Invalid regex in access log signature ' . $signature['name'] . ': ' . $signature['pattern'] . "\n";
+            exit(1);
+        }
+    }
+}
+
+lint_signatures();
 
 ////////////
 // Standalone scan modes: neither needs a scan directory, so they run and
