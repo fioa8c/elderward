@@ -81,6 +81,9 @@ if (isset($_GET['help'])) {
     echo "  scantimes=1           Report timestamp anomalies (files modified apart from their\n";
     echo "                        package, possible faked mtimes). Report-only heuristics.\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
+    echo "  quickscan=1           Quick high-signal checks: PHP in uploads, auto_prepend_file\n";
+    echo "                        directives, mu-plugins inventory, hidden PHP files.\n";
+    echo "                        scandirectory must be the WordPress root (default: current dir)\n";
     echo "  help=1                Show this help\n";
     die();
 }
@@ -1166,6 +1169,97 @@ function scanIntegrity($root)
 
 ////////////////
 //
+// Quick checks: cheap, high-signal places attackers hide
+//
+//////////////
+
+function check_prepend_directives($root, $config_path, &$counts)
+{
+    ///////////////
+    // auto_prepend_file / auto_append_file make PHP execute a file on EVERY
+    // request - the mechanism behind both Wordfence's WAF and a whole class
+    // of persistent backdoors.
+    //////////////
+    $content = @file_get_contents($config_path, false, null, 0, 65536);
+    if (false === $content) {
+        return;
+    }
+    // Leading [^;#] skips ini/htaccess comment lines.
+    if (!preg_match_all('/^[^;#\r\n]*auto_(?:prepend|append)_file[^\r\n]*/mi', $content, $matches)) {
+        return;
+    }
+
+    foreach ($matches[0] as $directive_line) {
+        $directive_line = trim($directive_line);
+        $target = '';
+        if (preg_match('/auto_(?:prepend|append)_file(?:\s*=|\s)\s*["\']?([^"\'\s]+)/i', $directive_line, $target_match)) {
+            $target = $target_match[1];
+        }
+        if ('' === $target || 'none' === strtolower($target)) {
+            continue;
+        }
+
+        if ('wordfence-waf.php' === basename($target) && is_dir($root . '/wp-content/plugins/wordfence')) {
+            report_finding('INFO', 'PHP_PREPEND', $config_path, 'Wordfence WAF bootstrap prepend: ' . $directive_line . ' - verify the target only loads wordfence/waf/bootstrap.php');
+        } else {
+            report_finding('MEDIUM', 'PHP_PREPEND', $config_path, $target . ' is executed on EVERY php request via: ' . $directive_line . ' - verify this file');
+        }
+        $counts['PHP_PREPEND']++;
+    }
+}
+
+function scanQuick($root)
+{
+    $root = rtrim($root, '/');
+    if (!is_file($root . '/wp-includes/version.php')) {
+        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
+        exit(1);
+    }
+
+    $counts = array('UPLOADS_PHP' => 0, 'PHP_PREPEND' => 0, 'MU_PLUGIN' => 0, 'HIDDEN_PHP' => 0);
+    $dir = new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS);
+    $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+
+    foreach ($files as $file) {
+        if (!$file->isFile()) {
+            continue;
+        }
+        $path = $file->getPathname();
+        $basename = $file->getFilename();
+
+        // Uploads hold media, never code: PHP there is the classic dropped
+        // webshell (plugins do scatter "Silence is golden" index.php files).
+        if (false !== strpos($path, '/wp-content/uploads/') && is_php_file($basename) && 'index.php' !== $basename) {
+            report_finding('HIGH', 'UPLOADS_PHP', $path, 'executable PHP inside wp-content/uploads - usually a webshell dropped through an upload form');
+            $counts['UPLOADS_PHP']++;
+            continue;
+        }
+
+        if (in_array($basename, array('.user.ini', 'php.ini', '.htaccess'), true)) {
+            check_prepend_directives($root, $path, $counts);
+            continue;
+        }
+
+        // mu-plugins load on every request with no activation step: a
+        // favorite persistence spot. Inventory, not accusation.
+        if (false !== strpos($path, '/wp-content/mu-plugins/') && is_php_file($basename)) {
+            report_finding('INFO', 'MU_PLUGIN', $path, 'must-use plugin: loads on every request with no activation step - confirm it is intentional');
+            $counts['MU_PLUGIN']++;
+            continue;
+        }
+
+        if ('.' === $basename[0] && is_php_file($basename)) {
+            report_finding('MEDIUM', 'HIDDEN_PHP', $path, 'hidden PHP file (dotfile) - rarely legitimate');
+            $counts['HIDDEN_PHP']++;
+        }
+    }
+
+    echo 'Quick scan complete: ' . $counts['UPLOADS_PHP'] . ' php-in-uploads, ' . $counts['PHP_PREPEND']
+        . ' prepend/append directives, ' . $counts['MU_PLUGIN'] . ' mu-plugins, ' . $counts['HIDDEN_PHP'] . " hidden php files\n";
+}
+
+////////////////
+//
 // Timestamp anomaly heuristics (report-only)
 //
 // Timestamps are leads, not proof: attackers fake mtimes (touch -t) and
@@ -1563,6 +1657,11 @@ if ( isset($_GET['scanintegrity']) ) {
 
 if ( isset($_GET['scantimes']) ) {
     scanTimestamps($_GET['scandirectory']);
+    die();
+}
+
+if ( isset($_GET['quickscan']) ) {
+    scanQuick($_GET['scandirectory']);
     die();
 }
 
