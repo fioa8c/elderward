@@ -23,6 +23,7 @@ php elderward.php scanlog=/var/log/apache2/access.log   # scan one access log fo
 php elderward.php scanlog=/var/log/apache2 # scan every access log in a directory (.gz included)
 php elderward.php scanintegrity=1 scandirectory=/path/to/wp-root   # verify core + plugins
 php elderward.php scanintegrity=1 checksumdir=/path/to/manifests   # ... without network access
+php elderward.php scantimes=1 scandirectory=/path/to/wp-root       # timestamp anomaly report
 php elderward.php help=1                   # show usage
 ```
 
@@ -63,6 +64,8 @@ Delete the file from the server when you're done.
 - **Crontab** — known persistence patterns (piped base64 decoders, pastebin downloads, tmp-dir droppers).
 - **Access logs** — known attack traffic: webshell requests, PHP files served from `wp-content/uploads`, wp-file-manager / Slider Revolution / TimThumb exploit attempts, `.env` probes, directory traversal, code and PHP-CGI injection, user enumeration, and xmlrpc/wp-login brute-force floods.
 - **Integrity** (`scanintegrity=1`) — verifies WordPress core and every plugin against the official wordpress.org checksums for the installed version. Reports `INTEGRITY_MODIFIED` (checksum mismatch), `INTEGRITY_MISSING` (file from the package gone), and `INTEGRITY_EXTRA` (file on disk that the package doesn't contain — extra PHP inside core or a plugin is the classic dropped webshell and reports as `HIGH`). Packages that can't be verified (custom/premium plugins, versions not in the archive) report as `INTEGRITY_NO_REFERENCE`, so a clean report never silently means "unchecked". Bundled themes/plugins under `wp-content` are skipped in the core pass (plugins are verified individually), `wp-config.php` is ignored, and themes are not covered yet — wordpress.org publishes no theme checksums.
+
+- **Timestamps** (`scantimes=1`) — report-only heuristics for when files were touched apart from their package. Every check is an outlier *within* one package (core, a plugin, a theme), never a comparison against a site-wide date, which would drown in false positives after any migration. `TIMESTAMP_OUTLIER` flags a handful of files modified after the package's dominant install/update cluster (the classic backdoored `functions.php` or dropped loader); a large newer cluster is a legitimate update and doesn't flag. `TIMESTAMP_TIMESTOMP` flags PHP files whose mtime sits far behind their ctime — `touch -t` can back-date content time, but the inode change time can't be set without root — and only when few files in the package show it, since migrations and `rsync -a` do that to whole trees. Timestamps are leads, not proof: attackers fake them and updates rewrite them, so these findings never feed a cleanup action and a clean result does not clear a file.
 
 ### Integrity checks without network access
 
