@@ -15,7 +15,7 @@ php elderward.php help=1            # list all scan modes and options
 
 There is no test suite. Testing is done by building synthetic fixtures (a fake WordPress root, tampered files, crafted access logs, offline checksum manifests/zips via `checksumdir=`) in a scratch directory and asserting on the output — see `TESTPLAN.md` for the canonical fixtures and expected results, including the live wordpress.org API tests that can only run on a networked machine. Every scanner must be exercised with both a positive case and its false-positive negatives (e.g. a legitimate plugin update must not trip the timestamp outlier check).
 
-Options are passed as `key=value` CLI args, which are parsed into `$_GET` (the same script runs over HTTP, gated by `WEB_ACCESS_TOKEN`). Scan modes are mutually exclusive; the first matching mode in the dispatch block runs and `die()`s.
+Options are passed as `key=value` CLI args, which are parsed into `$_GET` (the same script runs over HTTP, gated by `WEB_ACCESS_TOKEN`). Scan modes are mutually exclusive (enforced with an error; the one allowed combination is `scanall` + `scanlog`); each mode ends with `scan_exit()`, which exits 0 for clean/INFO-only, 2 for LOW/MEDIUM/ERROR findings, 3 for HIGH findings (1 is reserved for usage/fatal errors). `scanall=1` runs every scanner report-only and, in text mode, buffers findings to print them severity-sorted at the end.
 
 ## Architecture
 
@@ -28,7 +28,7 @@ One file, three layers:
 2. **Engine helpers** — `pattern_matches`/`signature_matches`/`apply_action` (file cleanup), `verify_against_manifest` + zip acquisition/restore helpers (integrity), clustering in `analyze_time_group` (timestamps).
 3. **Scan modes** — default recursive cleanup scan, `scancron`, `scanlog` (+`correlate`), `scanintegrity` (+`restore`, `quarantinedir`, `checksumdir` offline mode), `scantimes`, `quickscan`.
 
-All scanners report through `report_finding($severity, $type, $path, $detail)` printing `SEVERITY,TYPE,path,detail` — severities HIGH/MEDIUM/LOW/INFO/ERROR; indented lines under a finding are supporting context. Keep this contract: users pipe the output into grep/tickets.
+All scanners report through `report_finding($severity, $type, $path, $detail, $context)` — text mode prints `SEVERITY,TYPE,path,detail` (attacker-controlled fields percent-encoded) with context as indented lines; `format=json` prints NDJSON events on stdout with raw values and sends progress to stderr. Never `echo` from a scanner directly: findings go through `report_finding`, per-scanner footers through `emit_summary`, informational text through `progress` (which respects JSON mode). Keep these contracts: users pipe the output into grep, jq, and tickets.
 
 ## Invariants — do not break these
 

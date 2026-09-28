@@ -28,8 +28,13 @@ php elderward.php scanintegrity=1 restore=1 quarantinedir=/safe/place scandirect
 php elderward.php scantimes=1 scandirectory=/path/to/wp-root       # timestamp anomaly report
 php elderward.php quickscan=1 scandirectory=/path/to/wp-root       # uploads PHP, prepend hooks, mu-plugins
 php elderward.php scanlog=/var/log/apache2 correlate=1 scandirectory=/path/to/wp-root  # link traffic to files
+php elderward.php scanall=1 scandirectory=/path/to/wp-root         # every scanner, one sorted report
+php elderward.php scanall=1 scanlog=/var/log/apache2 scandirectory=/path/to/wp-root  # ... incl. logs
+php elderward.php scanall=1 format=json scandirectory=/path/to/wp-root               # machine-readable
 php elderward.php help=1                   # show usage
 ```
+
+`scanall=1` runs every scanner report-only (the signature pass is forced into dry run and `restore=1` is ignored) and prints the findings once, sorted worst-first. It's the "one command for a first look".
 
 **Always take a backup before cleaning.** `dryrun=1` is the safe way to see what would change first.
 
@@ -51,6 +56,19 @@ MEDIUM,LOG_IOC,/var/log/apache2/access.log,access.xmlrpc.flood: 4182 hit(s) - Hi
 ```
 
 Log IoCs report as `MEDIUM` (attack attempts, including failed ones) except traffic to a shell already on disk, which is `HIGH`. Noisy-by-nature signatures (e.g. `wp-login.php` POSTs) only fire above a volume threshold, so normal traffic doesn't raise alarms.
+
+### JSON output and exit codes
+
+`format=json` switches stdout to NDJSON — one event object per line, with raw (JSON-escaped) values:
+
+```
+{"event":"finding","severity":"HIGH","type":"LOG_IOC","path":"...","detail":"...","context":["e.g. ..."]}
+{"event":"summary","scan":"integrity","MODIFIED":1,"MISSING":0,...}
+```
+
+Progress and informational text moves to stderr, so stdout is pure machine-readable events for pipelines.
+
+The exit code reflects the worst finding, so cron jobs and CI can alert on it: **0** clean (or INFO-only), **1** usage/fatal error, **2** LOW/MEDIUM/ERROR findings, **3** HIGH findings. Note that a successful cleanup also exits 3 — malware was found.
 
 ### Running over HTTP (no shell access)
 

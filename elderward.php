@@ -84,7 +84,15 @@ if (isset($_GET['help'])) {
     echo "  quickscan=1           Quick high-signal checks: PHP in uploads, auto_prepend_file\n";
     echo "                        directives, mu-plugins inventory, hidden PHP files.\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
+    echo "  scanall=1             Run every scanner (report-only) against the WordPress root\n";
+    echo "                        and print one severity-sorted report. Add scanlog=/path to\n";
+    echo "                        include log IoCs and correlation.\n";
+    echo "  format=json           Machine-readable output: one JSON event per line on stdout\n";
+    echo "                        (findings and summaries); progress goes to stderr\n";
     echo "  help=1                Show this help\n";
+    echo "\n";
+    echo "Exit codes: 0 clean (or INFO-only findings), 1 usage/fatal error,\n";
+    echo "            2 LOW/MEDIUM/ERROR findings, 3 HIGH findings\n";
     die();
 }
 
@@ -121,7 +129,7 @@ function write_cleaned_file($file_path, $cleaned_conent)
 }
 
 ////////////////
-// Unified finding format, shared by every scanner:
+// Unified finding format, shared by every scanner. Text mode (default):
 //
 //   SEVERITY,TYPE,path,detail
 //
@@ -133,7 +141,40 @@ function write_cleaned_file($file_path, $cleaned_conent)
 // them: '%', control characters, and (in the path field) commas are
 // percent-encoded so a crafted filename cannot shift fields or inject
 // fake finding lines into the report.
+//
+// format=json switches stdout to NDJSON, one event object per line:
+//   {"event":"finding","severity":...,"type":...,"path":...,"detail":...}
+//   {"event":"summary","scan":...,...counts...}
+// Fields carry raw values (json_encode escapes them safely) and progress
+// text moves to STDERR, so stdout is pure machine-readable events.
+//
+// The exit code reflects the worst finding: 0 clean (or INFO only),
+// 1 usage/fatal error, 2 LOW/MEDIUM/ERROR findings, 3 HIGH findings.
 //////////////
+
+$FINDINGS_EXIT_CODE = 0;
+// When scanall=1 runs in text mode, findings buffer here and print
+// severity-sorted at the end; null means report immediately.
+$SCANALL_FINDINGS = null;
+
+function json_output()
+{
+    return (isset($_GET['format']) && 'json' === strtolower($_GET['format']));
+}
+
+function progress($text)
+{
+    // Informational text: normal output in text mode; in JSON mode it must
+    // stay off stdout, so it goes to STDERR (CLI) or nowhere (web).
+    if (!json_output()) {
+        echo $text;
+        return;
+    }
+    if (defined('STDERR')) {
+        fwrite(STDERR, $text);
+    }
+}
+
 function sanitize_finding_field($text, $encode_commas)
 {
     $text = str_replace('%', '%25', (string) $text);
@@ -145,9 +186,56 @@ function sanitize_finding_field($text, $encode_commas)
     }, $text);
 }
 
-function report_finding($severity, $type, $path, $detail)
+function print_text_finding($finding)
 {
-    echo $severity . ',' . $type . ',' . sanitize_finding_field($path, true) . ',' . sanitize_finding_field($detail, false) . "\n";
+    echo $finding['severity'] . ',' . $finding['type'] . ','
+        . sanitize_finding_field($finding['path'], true) . ','
+        . sanitize_finding_field($finding['detail'], false) . "\n";
+    foreach ($finding['context'] as $context_line) {
+        echo '    ' . sanitize_finding_field($context_line, false) . "\n";
+    }
+}
+
+function report_finding($severity, $type, $path, $detail, $context = array())
+{
+    global $FINDINGS_EXIT_CODE, $SCANALL_FINDINGS;
+
+    if ('HIGH' === $severity) {
+        $FINDINGS_EXIT_CODE = max($FINDINGS_EXIT_CODE, 3);
+    } elseif ('INFO' !== $severity) {
+        $FINDINGS_EXIT_CODE = max($FINDINGS_EXIT_CODE, 2);
+    }
+
+    if (json_output()) {
+        $event = array('event' => 'finding', 'severity' => $severity, 'type' => $type, 'path' => $path, 'detail' => $detail);
+        if (!empty($context)) {
+            $event['context'] = $context;
+        }
+        echo json_encode($event) . "\n";
+        return;
+    }
+
+    $finding = array('severity' => $severity, 'type' => $type, 'path' => $path, 'detail' => $detail, 'context' => $context);
+    if (is_array($SCANALL_FINDINGS)) {
+        $SCANALL_FINDINGS[] = $finding;
+        return;
+    }
+    print_text_finding($finding);
+}
+
+function emit_summary($scan, $data, $text)
+{
+    if (json_output()) {
+        echo json_encode(array_merge(array('event' => 'summary', 'scan' => $scan), $data)) . "\n";
+        return;
+    }
+    echo $text;
+}
+
+function scan_exit()
+{
+    global $FINDINGS_EXIT_CODE;
+    exit($FINDINGS_EXIT_CODE);
 }
 
 function recursive_file_iterator($dir)
@@ -446,13 +534,13 @@ function scanAccessLog($log_path, &$acc)
     //////////////
     $is_gzipped = ('gz' === strtolower(pathinfo($log_path, PATHINFO_EXTENSION)));
     if ($is_gzipped && !function_exists('gzopen')) {
-        echo 'Error: zlib not available, skipping compressed log ' . $log_path . "\n";
+        progress('Error: zlib not available, skipping compressed log ' . $log_path . "\n");
         return;
     }
 
     $fh = $is_gzipped ? @gzopen($log_path, 'r') : @fopen($log_path, 'r');
     if (false === $fh) {
-        echo 'Error reading ' . $log_path . "\n";
+        progress('Error reading ' . $log_path . "\n");
         return;
     }
 
@@ -527,7 +615,7 @@ function report_log_findings($acc, $target_label)
     // Report: every signature at or over its threshold, with example lines,
     // then the source IPs behind the reported hits.
     //////////////
-    echo "== Access log IoC report: " . $target_label . " ==\n";
+    progress("== Access log IoC report: " . $target_label . " ==\n");
 
     $reported = 0;
     $reported_ips = array();
@@ -543,10 +631,11 @@ function report_log_findings($acc, $target_label)
         }
 
         $severity = isset($signature['severity']) ? $signature['severity'] : 'MEDIUM';
-        report_finding($severity, 'LOG_IOC', $target_label, $name . ': ' . $hit_counts[$name] . ' hit(s) - ' . $signature['description']);
+        $context = array();
         foreach ($hit_examples[$name] as $example) {
-            echo "    e.g. " . sanitize_finding_field($example, false) . "\n";
+            $context[] = 'e.g. ' . $example;
         }
+        report_finding($severity, 'LOG_IOC', $target_label, $name . ': ' . $hit_counts[$name] . ' hit(s) - ' . $signature['description'], $context);
 
         foreach ($hit_ips[$name] as $ip => $count) {
             $reported_ips[$ip] = isset($reported_ips[$ip]) ? $reported_ips[$ip] + $count : $count;
@@ -554,15 +643,17 @@ function report_log_findings($acc, $target_label)
     }
 
     if (0 === $reported) {
-        echo "No known IoCs found.\n";
+        emit_summary('scanlog', array('flagged_signatures' => 0), "No known IoCs found.\n");
         return (array());
     }
 
     arsort($reported_ips);
-    echo "Top source IPs on flagged requests:\n";
-    foreach (array_slice($reported_ips, 0, 10, true) as $ip => $count) {
-        echo "    " . $ip . " (" . $count . " hits)\n";
+    $top_ips = array_slice($reported_ips, 0, 10, true);
+    $text = "Top source IPs on flagged requests:\n";
+    foreach ($top_ips as $ip => $count) {
+        $text .= "    " . $ip . " (" . $count . " hits)\n";
     }
+    emit_summary('scanlog', array('flagged_signatures' => $reported, 'top_ips' => $top_ips), $text);
 
     return ($flagged_minutes);
 }
@@ -598,13 +689,13 @@ function scanLogTarget($target)
         if (preg_match('@(?:access[^/]*|\.log(?:\.\d+)?(?:\.gz)?)$@i', $basename) !== 1) {
             continue;
         }
-        echo 'Scanning ' . $file->getPathname() . "\n";
+        progress('Scanning ' . $file->getPathname() . "\n");
         scanAccessLog($file->getPathname(), $acc);
         $logs_found++;
     }
 
     if (0 === $logs_found) {
-        echo 'No access log files found in ' . $target . "\n";
+        progress('No access log files found in ' . $target . "\n");
         return (array());
     }
     return (report_log_findings($acc, $target));
@@ -618,7 +709,7 @@ function correlate_files($root, $flagged_minutes, $window)
     // miss clears nothing (later edits and faked mtimes erase the link).
     //////////////
     if (empty($flagged_minutes)) {
-        echo "Correlation: no flagged log traffic to correlate against.\n";
+        progress("Correlation: no flagged log traffic to correlate against.\n");
         return;
     }
     if (!is_dir($root) || !is_readable($root)) {
@@ -662,13 +753,14 @@ function correlate_files($root, $flagged_minutes, $window)
         $severity = is_php_file($path) ? 'HIGH' : 'MEDIUM';
         report_finding($severity, 'LOG_FILE_CORRELATION', $path,
             'modified ' . date('Y-m-d H:i:s', $mtime) . ' within ' . $window . 's of flagged traffic: '
-            . implode(' ', array_keys($in_window['names'])) . ' (' . $in_window['count'] . ' flagged requests in window)');
-        echo '    e.g. ' . sanitize_finding_field($in_window['example'], false) . "\n";
+            . implode(' ', array_keys($in_window['names'])) . ' (' . $in_window['count'] . ' flagged requests in window)',
+            array('e.g. ' . $in_window['example']));
         $correlated++;
     }
 
-    echo 'Correlation complete: ' . $correlated . ' file(s) modified within ' . $window
-        . "s of flagged traffic. Later edits or faked mtimes erase this link - a miss clears nothing.\n";
+    emit_summary('correlate', array('correlated' => $correlated, 'window_seconds' => $window),
+        'Correlation complete: ' . $correlated . ' file(s) modified within ' . $window
+        . "s of flagged traffic. Later edits or faked mtimes erase this link - a miss clears nothing.\n");
 }
 
 ////////////////
@@ -1101,7 +1193,7 @@ function scanIntegrity($root)
         $quarantine_real = @realpath($_GET['quarantinedir']);
         $root_real = @realpath($root);
         if (false !== $quarantine_real && false !== $root_real && 0 === strpos($quarantine_real . '/', $root_real . '/')) {
-            echo "Warning: quarantinedir is inside the scanned tree - move it outside the webroot so quarantined files cannot be served.\n";
+            progress("Warning: quarantinedir is inside the scanned tree - move it outside the webroot so quarantined files cannot be served.\n");
         }
     }
 
@@ -1129,7 +1221,7 @@ function scanIntegrity($root)
             report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $root, 'core ' . $wp_version . ' (' . $locale . '): no reference checksums available (' . $status . ')');
             $totals['NO_REFERENCE']++;
         } else {
-            echo 'Checking core ' . $wp_version . ' (' . count($data['checksums']) . " files)\n";
+            progress('Checking core ' . $wp_version . ' (' . count($data['checksums']) . " files)\n");
             $manifest = array();
             foreach ($data['checksums'] as $relative_path => $expected) {
                 if (0 === strpos($relative_path, 'wp-content/')) {
@@ -1152,7 +1244,7 @@ function scanIntegrity($root)
             $restorable = verify_against_manifest($root, $manifest, 'core ' . $wp_version, $present, $totals);
             if (isset($_GET['restore']) && count($restorable) > 0) {
                 if ('en_US' !== $locale) {
-                    echo "Restore of non-en_US core packages is not supported yet; skipping core restore.\n";
+                    progress("Restore of non-en_US core packages is not supported yet; skipping core restore.\n");
                 } else {
                     restore_package_files($root,
                         'https://wordpress.org/wordpress-' . rawurlencode($wp_version) . '.zip',
@@ -1193,7 +1285,7 @@ function scanIntegrity($root)
             continue;
         }
 
-        echo 'Checking plugin ' . $slug . ' ' . $version . ' (' . count($data['files']) . " files)\n";
+        progress('Checking plugin ' . $slug . ' ' . $version . ' (' . count($data['files']) . " files)\n");
         $manifest = array();
         foreach ($data['files'] as $relative_path => $sums) {
             $manifest[$relative_path] = isset($sums['md5']) ? $sums['md5'] : null;
@@ -1247,7 +1339,7 @@ function scanIntegrity($root)
                 report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $theme_dir, 'theme ' . $slug . ' ' . $version . ': could not read the official theme package');
                 $totals['NO_REFERENCE']++;
             } else {
-                echo 'Checking theme ' . $slug . ' ' . $version . ' (' . count($manifest) . " files)\n";
+                progress('Checking theme ' . $slug . ' ' . $version . ' (' . count($manifest) . " files)\n");
                 $restorable = verify_against_manifest($theme_dir, $manifest, 'theme ' . $slug . ' ' . $version, list_files_recursive($theme_dir, $theme_dir), $totals);
                 if (isset($_GET['restore']) && count($restorable) > 0) {
                     restore_items_from_zip($zip_path, $slug . '/', $theme_dir, $restorable, 'theme ' . $slug . ' ' . $version);
@@ -1269,9 +1361,10 @@ function scanIntegrity($root)
         $totals['NO_REFERENCE']++;
     }
 
-    echo 'Integrity scan complete: ' . $totals['MODIFIED'] . ' modified, ' . $totals['MISSING'] . ' missing, '
+    emit_summary('integrity', $totals,
+        'Integrity scan complete: ' . $totals['MODIFIED'] . ' modified, ' . $totals['MISSING'] . ' missing, '
         . $totals['EXTRA'] . ' extra, ' . $totals['UNREADABLE'] . ' unreadable, '
-        . $totals['NO_REFERENCE'] . " without reference checksums\n";
+        . $totals['NO_REFERENCE'] . " without reference checksums\n");
 }
 
 ////////////////
@@ -1356,8 +1449,9 @@ function scanQuick($root)
         }
     }
 
-    echo 'Quick scan complete: ' . $counts['UPLOADS_PHP'] . ' php-in-uploads, ' . $counts['PHP_PREPEND']
-        . ' prepend/append directives, ' . $counts['MU_PLUGIN'] . ' mu-plugins, ' . $counts['HIDDEN_PHP'] . " hidden php files\n";
+    emit_summary('quickscan', $counts,
+        'Quick scan complete: ' . $counts['UPLOADS_PHP'] . ' php-in-uploads, ' . $counts['PHP_PREPEND']
+        . ' prepend/append directives, ' . $counts['MU_PLUGIN'] . ' mu-plugins, ' . $counts['HIDDEN_PHP'] . " hidden php files\n");
 }
 
 ////////////////
@@ -1517,8 +1611,9 @@ function scanTimestamps($root)
         }
     }
 
-    echo 'Timestamp scan complete: ' . $totals['OUTLIER'] . ' outliers, ' . $totals['TIMESTOMP']
-        . " possible timestomps. Timestamps are leads, not proof - a clean result does not clear a file.\n";
+    emit_summary('timestamps', $totals,
+        'Timestamp scan complete: ' . $totals['OUTLIER'] . ' outliers, ' . $totals['TIMESTOMP']
+        . " possible timestomps. Timestamps are leads, not proof - a clean result does not clear a file.\n");
 }
 
 function pattern_matches($condition, $file_buffer)
@@ -1731,12 +1826,14 @@ lint_signatures();
 // asking for more than one is an error instead.
 ///////////
 $requested_modes = array();
-foreach (array('scancron', 'scanlog', 'scanintegrity', 'scantimes', 'quickscan') as $mode) {
+foreach (array('scanall', 'scancron', 'scanlog', 'scanintegrity', 'scantimes', 'quickscan') as $mode) {
     if (isset($_GET[$mode])) {
         $requested_modes[] = $mode;
     }
 }
-if (count($requested_modes) > 1) {
+// scanall consumes scanlog as its log input; every other combination would
+// silently run only one mode, so it is an error instead.
+if (count($requested_modes) > 1 && $requested_modes !== array('scanall', 'scanlog')) {
     echo 'Error: scan modes are mutually exclusive, run them one at a time: ' . implode(', ', $requested_modes) . "\n";
     exit(1);
 }
@@ -1746,84 +1843,157 @@ if ( isset($_GET['correlate']) && !isset($_GET['scanlog']) ) {
     exit(1);
 }
 
+if ( isset($_GET['scanall']) ) {
+    scanAll();
+    scan_exit();
+}
+
 if ( isset($_GET['scancron']) ) {
     scanCronTab();
-    die();
+    scan_exit();
 }
 
 if ( isset($_GET['scanlog']) ) {
     $flagged_minutes = scanLogTarget($_GET['scanlog']);
     if ( isset($_GET['correlate']) ) {
-        $window = isset($_GET['window']) ? max(60, (int) $_GET['window']) : 300;
-        correlate_files($_GET['scandirectory'], $flagged_minutes, $window);
+        correlate_files($_GET['scandirectory'], $flagged_minutes, correlation_window());
     }
-    die();
+    scan_exit();
 }
 
 if ( isset($_GET['scanintegrity']) ) {
     scanIntegrity($_GET['scandirectory']);
-    die();
+    scan_exit();
 }
 
 if ( isset($_GET['scantimes']) ) {
     scanTimestamps($_GET['scandirectory']);
-    die();
+    scan_exit();
 }
 
 if ( isset($_GET['quickscan']) ) {
     scanQuick($_GET['scandirectory']);
-    die();
+    scan_exit();
 }
 
 ////////////
-// using RecursiveDirectoryIterator and RecursiveIteratorIterator to crawl the directories
-// using SKIP_DOTS because it's not important
+// Default mode: recursive signature scan/cleanup of scandirectory.
 ///////////
-if (!is_dir($_GET['scandirectory']) || !is_readable($_GET['scandirectory'])) {
-    echo 'Error: cannot open scan directory ' . $_GET['scandirectory'] . "\n";
-    exit(1);
+run_signature_scan($_GET['scandirectory']);
+scan_exit();
+
+function run_signature_scan($scan_dir)
+{
+    global $filesize_limit;
+
+    if (!is_dir($scan_dir) || !is_readable($scan_dir)) {
+        echo 'Error: cannot open scan directory ' . $scan_dir . "\n";
+        exit(1);
+    }
+
+    $files = recursive_file_iterator($scan_dir);
+
+    ///////////
+    // iterating through the files collected
+    //////////
+    foreach ($files as $file) {
+        $target_file = $file->getPathname();
+
+        //////////
+        //// Skip this script itself and anything outside the risky-extension
+        //// list (scan_all=1 overrides) - shared with the correlate walk.
+        /////////
+        if ( !is_scannable_file($file) ) {
+            continue;
+        }
+        ///////////
+        // Another condition is the filesize.
+        //////////
+        $filesize = @filesize($target_file);
+        if ( $filesize > $filesize_limit ) {
+            continue;
+        }
+        /////////
+        // Starting the scanning process by opening the file and reading a limited buffer
+        ///////
+        $fh = @fopen($target_file, 'r');
+        if (false === $fh) {
+            progress('Error reading ' . $target_file . "\n");
+            continue;
+        }
+        $buffer = @fread($fh, $filesize_limit);
+        @fclose($fh);
+        if (false === $buffer) {
+            progress('Error reading ' . $target_file . "\n");
+            continue;
+        }
+
+        //////////
+        //  Performing the cleanup
+        //////////
+        cleanup_util($buffer, $target_file);
+    }
 }
 
-$files = recursive_file_iterator($_GET['scandirectory']);
+function correlation_window()
+{
+    return isset($_GET['window']) ? max(60, (int) $_GET['window']) : 300;
+}
 
-///////////
-// iterating through the files collected
-//////////
-foreach( $files as $file ){
-    $target_file = $file->getPathname();
+function scanAll()
+{
+    global $SCANALL_FINDINGS;
 
-//////////
-//// Skip this script itself and anything outside the risky-extension list
-//// (scan_all=1 overrides) - shared with the correlate walk.
-/////////
-    if ( !is_scannable_file($file) ) {
-        continue;
+    ///////////////
+    // One command for the first look: every scanner in sequence against the
+    // WordPress root, report-only (the signature pass is forced into dry
+    // run and restore is ignored). In text mode findings buffer and print
+    // severity-sorted at the end; format=json streams events as usual.
+    //////////////
+    $root = require_wordpress_root($_GET['scandirectory']);
+    $_GET['scandirectory'] = $root;
+    $_GET['dryrun'] = 1;
+    if (isset($_GET['restore'])) {
+        progress("scanall is report-only: ignoring restore=1 (run scanintegrity=1 restore=1 separately)\n");
+        unset($_GET['restore']);
     }
-///////////
-// Another condition is the filesize.
-//////////
-    $filesize = @filesize($target_file);
-    if ( $filesize > $filesize_limit ) {
-        continue;
-    }
-/////////
-// Starting the scanning process by opening the file and reading a limited buffer
-///////
-    //echo "Scanning $target_file \n";
-    $fh = @fopen($target_file, 'r');
-    if (false === $fh) {
-        echo 'Error reading ' . $target_file . "\n";
-        continue;
-    }
-    $buffer = @fread($fh, $filesize_limit);
-    @fclose($fh);
-    if (false === $buffer) {
-        echo 'Error reading ' . $target_file . "\n";
-        continue;
+    if (!json_output()) {
+        $SCANALL_FINDINGS = array();
     }
 
-//////////
-//  Performing the cleanup
-//////////
-    cleanup_util($buffer, $target_file);
+    progress("== Quick checks ==\n");
+    scanQuick($root);
+    progress("== Integrity ==\n");
+    scanIntegrity($root);
+    progress("== Timestamps ==\n");
+    scanTimestamps($root);
+    progress("== Crontab ==\n");
+    scanCronTab();
+    if (isset($_GET['scanlog'])) {
+        progress("== Access logs ==\n");
+        $flagged_minutes = scanLogTarget($_GET['scanlog']);
+        correlate_files($root, $flagged_minutes, correlation_window());
+    }
+    progress("== Malware signatures (dry run) ==\n");
+    run_signature_scan($root);
+
+    if (!is_array($SCANALL_FINDINGS)) {
+        return;
+    }
+
+    ///////////////
+    // Flush the buffered findings worst-first. ERROR sits right after HIGH:
+    // something that blocked verification needs eyes too.
+    //////////////
+    $buffered = $SCANALL_FINDINGS;
+    $SCANALL_FINDINGS = null;
+
+    echo "\n== Findings by severity (" . count($buffered) . ") ==\n";
+    foreach (array('HIGH', 'ERROR', 'MEDIUM', 'LOW', 'INFO') as $severity_group) {
+        foreach ($buffered as $finding) {
+            if ($finding['severity'] === $severity_group) {
+                print_text_finding($finding);
+            }
+        }
+    }
 }
