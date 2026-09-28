@@ -26,7 +26,9 @@ One file, three layers:
    - `$ACCESS_LOG_SIGS`: per-line log patterns with a `threshold` (volume-based signatures like wp-login floods only report above it) and optional `severity` (default MEDIUM; HIGH means traffic to a shell already on disk).
    - `$CRONTAB_SIGS`: name => pattern pairs.
 2. **Engine helpers** — `pattern_matches`/`signature_matches`/`apply_action` (file cleanup), `verify_against_manifest` + zip acquisition/restore helpers (integrity), clustering in `analyze_time_group` (timestamps).
-3. **Scan modes** — default recursive cleanup scan, `scancron`, `scanlog` (+`correlate`), `scanintegrity` (+`restore`, `quarantinedir`, `checksumdir` offline mode), `scantimes`, `quickscan`.
+3. **Scan modes** — default recursive cleanup scan, `scancron`, `scanlog` (+`correlate`), `scanintegrity` (+`restore`, `quarantinedir`, `checksumdir` offline mode), `scantimes`, `quickscan`, `scandb`, and `scanall` (runs every scanner report-only). `$DB_OPTION_SIGS`/`$DB_POST_SIGS` are two more lint-checked signature arrays consumed by `scandb`.
+
+`scandb` is read-only (SELECT-only): credentials come from `parse_wp_config()` (regex, **never** `include`), and DB values are pattern-matched, **never `unserialize()`d** (PHP object injection) — `active_plugins` entries are extracted with a regex. Connection/credential/extension failures are fatal for standalone `scandb` but a non-fatal skip inside `scanall` (the `$fatal_on_error` arg).
 
 All scanners report through `report_finding($severity, $type, $path, $detail, $context)` — text mode prints `SEVERITY,TYPE,path,detail` (attacker-controlled fields percent-encoded) with context as indented lines; `format=json` prints NDJSON events on stdout with raw values and sends progress to stderr. Never `echo` from a scanner directly: findings go through `report_finding`, per-scanner footers through `emit_summary`, informational text through `progress` (which respects JSON mode). Keep these contracts: users pipe the output into grep, jq, and tickets.
 

@@ -157,6 +157,29 @@ Expect: `INFO,INTEGRITY_RESTORED,...functions.php,core <ver>: pristine copy rest
 
 ---
 
+## E. Database scan (needs a real WordPress DB)
+
+Run against `$WP` (or a copy of a real site). The scan is **read-only** — it issues only SELECTs — but run it against a staging copy if you're cautious.
+
+**E1. Baseline on a clean install.** `$EW scandb=1 scandirectory=$WP`
+
+Expect: a `DB_ADMIN_USER` INFO line per administrator, `DB_SITE_URL` INFO lines for `siteurl`/`home`, and `0 flagged options, 0 flagged posts`. On a fresh install this should be all INFO (exit 0). **PASTE the output** — real sites carry legitimate `<script src=...>` analytics snippets in options that flag as `DB_OPTION_IOC` (MEDIUM); those are the tuning input for the option signatures.
+
+**E2. Planted artifacts are caught.** On a throwaway DB:
+
+```sql
+INSERT INTO wp_options (option_name, option_value) VALUES ('ew_test','<script>eval(atob("eA=="))</script>');
+UPDATE wp_options SET option_value='http://evil.example/' WHERE option_name='siteurl';
+-- create a fresh admin through wp-admin, or:
+-- INSERT a user + wp_usermeta row with meta_key wp_capabilities LIKE '%administrator%'
+```
+
+Expect: `HIGH,DB_OPTION_IOC` for `ew_test`, `HIGH,DB_SITE_URL` for the non-URL... (`http://evil.example/` is a valid URL so it reports INFO — the point is it should now differ from your real address, which the operator eyeballs), and `MEDIUM,DB_NEW_ADMIN` for the new admin. Remember to restore `siteurl` afterward or the site breaks.
+
+**E3. Non-standard setups.** If your site uses a custom `$table_prefix`, external DB host, or has `wp-config.php` one level above the web root, confirm E1 still connects. **PASTE any connection error** — DB_HOST parsing (socket vs port) is the most likely real-world snag.
+
+---
+
 ## What to paste back
 
 1. B1 output (always), B4/C4 outputs if you can run them (always), `php -v` and the OS.

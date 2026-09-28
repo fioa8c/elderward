@@ -81,6 +81,10 @@ if (isset($_GET['help'])) {
     echo "  scantimes=1           Report timestamp anomalies (files modified apart from their\n";
     echo "                        package, possible faked mtimes). Report-only heuristics.\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
+    echo "  scandb=1              Scan the WordPress database (read-only, credentials from\n";
+    echo "                        wp-config.php): administrator inventory and recent admins,\n";
+    echo "                        injected options, siteurl/home hijacks, active_plugins\n";
+    echo "                        tampering, script/PHP injections in posts\n";
     echo "  quickscan=1           Quick high-signal checks: PHP in uploads, auto_prepend_file\n";
     echo "                        directives, mu-plugins inventory, hidden PHP files.\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
@@ -1373,6 +1377,334 @@ function scanIntegrity($root)
 //
 //////////////
 
+////////////////
+//
+// Database scanning (report-only, SELECT-only)
+//
+// A large share of WordPress compromises live partly or entirely in the
+// database: rogue administrators, script injections in options and posts,
+// hijacked siteurl/home. Everything read from the DB is hostile data -
+// values are pattern-matched only, NEVER unserialize()d (PHP object
+// injection) and never executed.
+//////////////
+
+// An administrator registered this recently on a compromised site is the
+// classic takeover artifact.
+define('RECENT_ADMIN_DAYS', 30);
+// Only the first 256KB of a value is scanned, so a giant transient or post
+// cannot balloon memory.
+define('DB_VALUE_SCAN_CAP', 262144);
+
+$DB_OPTION_SIGS = array(
+    array(
+        'name'        => 'db.option.php-exec',
+        'pattern'     => '@(?:eval\s*\(|base64_decode\s*\(|gzinflate\s*\(|assert\s*\(|create_function\s*\()@i',
+        'severity'    => 'HIGH',
+        'description' => 'PHP execution/decoding functions inside an option value - options should hold settings, never code',
+    ),
+    array(
+        'name'        => 'db.option.php-tag',
+        'pattern'     => '@<\?php@i',
+        'severity'    => 'HIGH',
+        'description' => 'PHP tag inside an option value',
+    ),
+    array(
+        'name'        => 'db.option.hidden-iframe',
+        'pattern'     => '@<iframe[^>]*(?:display\s*:\s*none|visibility\s*:\s*hidden|width=["\']?0["\']?[\s>]|height=["\']?0["\']?[\s>])@i',
+        'severity'    => 'HIGH',
+        'description' => 'Hidden iframe inside an option value - a classic drive-by injection',
+    ),
+    array(
+        'name'        => 'db.option.js-obfuscation',
+        'pattern'     => '@(?:String\.fromCharCode\s*\(|atob\s*\(|unescape\s*\(\s*[\'"]%)@i',
+        'severity'    => 'MEDIUM',
+        'description' => 'Obfuscated JavaScript inside an option value',
+    ),
+    array(
+        'name'        => 'db.option.script-src',
+        'pattern'     => '@<script[^>]+src\s*=@i',
+        'severity'    => 'MEDIUM',
+        'description' => 'Remote script tag inside an option value - theme/plugin settings can legitimately hold analytics snippets, verify the source',
+    ),
+);
+
+$DB_POST_SIGS = array(
+    array(
+        'name'        => 'db.post.php-tag',
+        'pattern'     => '@<\?php@',
+        'severity'    => 'HIGH',
+        'description' => 'PHP tag inside post content - WordPress never stores executable PHP in posts',
+    ),
+    array(
+        'name'        => 'db.post.hidden-iframe',
+        'pattern'     => '@<iframe[^>]*(?:display\s*:\s*none|visibility\s*:\s*hidden)@i',
+        'severity'    => 'HIGH',
+        'description' => 'Hidden iframe inside post content',
+    ),
+    array(
+        'name'        => 'db.post.js-obfuscation',
+        'pattern'     => '@(?:String\.fromCharCode\s*\(|atob\s*\(|unescape\s*\(\s*[\'"]%|eval\s*\()@i',
+        'severity'    => 'MEDIUM',
+        'description' => 'Obfuscated JavaScript inside post content',
+    ),
+);
+
+function parse_wp_config($root)
+{
+    ///////////////
+    // The config is parsed with regexes, never include()d - it sits on a
+    // compromised host and must not get to run code inside the scanner.
+    // wp-config.php commonly lives one directory above the WP root too.
+    //////////////
+    $config_path = null;
+    foreach (array($root . '/wp-config.php', dirname($root) . '/wp-config.php') as $candidate) {
+        if (is_file($candidate)) {
+            $config_path = $candidate;
+            break;
+        }
+    }
+    if (null === $config_path) {
+        return (null);
+    }
+
+    $content = @file_get_contents($config_path);
+    if (false === $content) {
+        return (null);
+    }
+
+    $config = array('path' => $config_path, 'prefix' => 'wp_');
+    foreach (array('DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST') as $constant) {
+        if (preg_match('/define\s*\(\s*[\'"]' . $constant . '[\'"]\s*,\s*([\'"])(.*?)\1\s*\)/', $content, $matches)) {
+            $config[$constant] = $matches[2];
+        }
+    }
+    if (preg_match('/\$table_prefix\s*=\s*[\'"]([A-Za-z0-9_]+)[\'"]/', $content, $matches)) {
+        $config['prefix'] = $matches[1];
+    }
+
+    if (!isset($config['DB_NAME'], $config['DB_USER'], $config['DB_PASSWORD'], $config['DB_HOST'])) {
+        return (null);
+    }
+    // The prefix goes into query strings: anything but [A-Za-z0-9_] is
+    // either broken or an injection attempt from a tampered config.
+    if (preg_match('/^[A-Za-z0-9_]+$/', $config['prefix']) !== 1) {
+        return (null);
+    }
+    return ($config);
+}
+
+function db_connect($config)
+{
+    // PHP 8.1+ throws mysqli exceptions by default; this engine handles
+    // errors fail-closed on return values instead.
+    mysqli_report(MYSQLI_REPORT_OFF);
+
+    // DB_HOST can be "host", "host:port", or "host:/path/to/socket".
+    $host = $config['DB_HOST'];
+    $port = null;
+    $socket = null;
+    if (false !== strpos($host, ':')) {
+        list($host, $port_or_socket) = explode(':', $host, 2);
+        if (0 === strpos($port_or_socket, '/')) {
+            $socket = $port_or_socket;
+        } else {
+            $port = (int) $port_or_socket;
+        }
+    }
+
+    $db = @mysqli_connect($host, $config['DB_USER'], $config['DB_PASSWORD'], $config['DB_NAME'], $port, $socket);
+    if (false === $db || null === $db) {
+        return (null);
+    }
+    @mysqli_set_charset($db, 'utf8mb4');
+    return ($db);
+}
+
+function scan_db_admins($db, $prefix, &$counts)
+{
+    $sql = 'SELECT u.ID, u.user_login, u.user_email, u.user_registered'
+        . ' FROM ' . $prefix . 'users u'
+        . ' JOIN ' . $prefix . 'usermeta m ON m.user_id = u.ID'
+        . " WHERE m.meta_key = '" . $prefix . "capabilities' AND m.meta_value LIKE '%administrator%'";
+    $result = @mysqli_query($db, $sql);
+    if (false === $result) {
+        progress('Error querying users: ' . mysqli_error($db) . "\n");
+        return;
+    }
+
+    $recent_cutoff = time() - (RECENT_ADMIN_DAYS * 86400);
+    while ($row = mysqli_fetch_assoc($result)) {
+        $counts['ADMINS']++;
+        $registered = strtotime($row['user_registered']);
+        $where = 'db:' . $prefix . 'users:ID=' . $row['ID'];
+        $who = '"' . $row['user_login'] . '" <' . $row['user_email'] . '> registered ' . $row['user_registered'];
+
+        if (false !== $registered && $registered >= $recent_cutoff) {
+            report_finding('MEDIUM', 'DB_NEW_ADMIN', $where, 'administrator ' . $who . ' - created within the last ' . RECENT_ADMIN_DAYS . ' days, the classic takeover artifact; verify who created it');
+        } else {
+            report_finding('INFO', 'DB_ADMIN_USER', $where, 'administrator ' . $who . ' - confirm this account is known');
+        }
+    }
+    mysqli_free_result($result);
+}
+
+function scan_db_options($db, $prefix, $root, &$counts)
+{
+    global $DB_OPTION_SIGS;
+
+    // MYSQLI_USE_RESULT streams rows; SUBSTRING caps each value read.
+    $sql = 'SELECT option_name, SUBSTRING(option_value, 1, ' . DB_VALUE_SCAN_CAP . ') FROM ' . $prefix . 'options';
+    $result = @mysqli_query($db, $sql, MYSQLI_USE_RESULT);
+    if (false === $result) {
+        progress('Error querying options: ' . mysqli_error($db) . "\n");
+        return;
+    }
+
+    while ($row = mysqli_fetch_row($result)) {
+        $counts['OPTIONS']++;
+        $option_name = $row[0];
+        $value = (string) $row[1];
+        $where = 'db:' . $prefix . 'options:' . $option_name;
+
+        ///////////////
+        // siteurl/home hijacks redirect every visitor; report the values
+        // as inventory even when they look sane.
+        //////////////
+        if ('siteurl' === $option_name || 'home' === $option_name) {
+            if (preg_match('@^https?://[^\s<>\'"]+$@', $value) === 1) {
+                report_finding('INFO', 'DB_SITE_URL', $where, $option_name . ' = ' . $value . ' - confirm this is the real site address');
+            } else {
+                report_finding('HIGH', 'DB_SITE_URL', $where, $option_name . ' does not look like a plain URL (hijack or injection): ' . substr($value, 0, 200));
+                $counts['FLAGGED_OPTIONS']++;
+            }
+            continue;
+        }
+
+        ///////////////
+        // active_plugins is serialized PHP; extract the .php entries with a
+        // regex (NEVER unserialize hostile data) and sanity-check each.
+        //////////////
+        if ('active_plugins' === $option_name) {
+            if (preg_match_all('@"((?:[^"\\\\]|\\\\.)*?\.php)"@', $value, $matches)) {
+                foreach ($matches[1] as $plugin_entry) {
+                    if (false !== strpos($plugin_entry, '..')) {
+                        report_finding('HIGH', 'DB_ACTIVE_PLUGIN', $where, 'active plugin path escapes the plugins directory: ' . $plugin_entry);
+                        $counts['FLAGGED_OPTIONS']++;
+                    } elseif (!is_file($root . '/wp-content/plugins/' . $plugin_entry)) {
+                        report_finding('LOW', 'DB_ACTIVE_PLUGIN', $where, 'active plugin file missing on disk: ' . $plugin_entry);
+                    }
+                }
+            }
+            continue;
+        }
+
+        foreach ($DB_OPTION_SIGS as $signature) {
+            if (preg_match($signature['pattern'], $value) !== 1) {
+                continue;
+            }
+            report_finding($signature['severity'], 'DB_OPTION_IOC', $where,
+                $signature['name'] . ': ' . $signature['description'],
+                array('e.g. ' . substr($value, max(0, strpos($value, '<') === false ? 0 : strpos($value, '<')), 200)));
+            $counts['FLAGGED_OPTIONS']++;
+            break;
+        }
+    }
+    mysqli_free_result($result);
+}
+
+function scan_db_posts($db, $prefix, &$counts)
+{
+    global $DB_POST_SIGS;
+
+    ///////////////
+    // The posts table can be huge: a LIKE prefilter runs server-side and
+    // only candidates come back (streamed, value capped) for the real
+    // pattern check.
+    //////////////
+    $sql = 'SELECT ID, post_title, post_type, SUBSTRING(post_content, 1, ' . DB_VALUE_SCAN_CAP . ')'
+        . ' FROM ' . $prefix . 'posts'
+        . " WHERE post_content LIKE '%<?php%' OR post_content LIKE '%eval(%'"
+        . " OR post_content LIKE '%fromCharCode%' OR post_content LIKE '%atob(%'"
+        . " OR post_content LIKE '%unescape(%' OR post_content LIKE '%<iframe%'";
+    $result = @mysqli_query($db, $sql, MYSQLI_USE_RESULT);
+    if (false === $result) {
+        progress('Error querying posts: ' . mysqli_error($db) . "\n");
+        return;
+    }
+
+    $max_reported = 100;
+    $suppressed = 0;
+    while ($row = mysqli_fetch_row($result)) {
+        $content = (string) $row[3];
+        foreach ($DB_POST_SIGS as $signature) {
+            if (preg_match($signature['pattern'], $content) !== 1) {
+                continue;
+            }
+            $counts['FLAGGED_POSTS']++;
+            if ($counts['FLAGGED_POSTS'] > $max_reported) {
+                $suppressed++;
+            } else {
+                report_finding($signature['severity'], 'DB_POST_IOC', 'db:' . $prefix . 'posts:ID=' . $row[0],
+                    $signature['name'] . ' in ' . $row[2] . ' "' . $row[1] . '": ' . $signature['description']);
+            }
+            break;
+        }
+    }
+    mysqli_free_result($result);
+
+    if ($suppressed > 0) {
+        progress('...and ' . $suppressed . " more flagged posts not listed\n");
+    }
+}
+
+function scanDatabase($root, $fatal_on_error)
+{
+    $root = rtrim($root, '/');
+
+    $failure = null;
+    if (!function_exists('mysqli_connect')) {
+        $failure = 'PHP mysqli extension not available, cannot scan the database';
+    }
+
+    $config = null;
+    if (null === $failure) {
+        $config = parse_wp_config($root);
+        if (null === $config) {
+            $failure = 'could not read DB credentials from wp-config.php (looked in ' . $root . ' and its parent)';
+        }
+    }
+
+    $db = null;
+    if (null === $failure) {
+        $db = db_connect($config);
+        if (null === $db) {
+            $failure = 'could not connect to the database as ' . $config['DB_USER'] . '@' . $config['DB_HOST'];
+        }
+    }
+
+    if (null !== $failure) {
+        if ($fatal_on_error) {
+            echo 'Error: ' . $failure . "\n";
+            exit(1);
+        }
+        progress('Skipping database scan: ' . $failure . "\n");
+        return;
+    }
+
+    progress('Scanning database ' . $config['DB_NAME'] . ' (prefix ' . $config['prefix'] . ") - read-only\n");
+    $counts = array('ADMINS' => 0, 'OPTIONS' => 0, 'FLAGGED_OPTIONS' => 0, 'FLAGGED_POSTS' => 0);
+
+    scan_db_admins($db, $config['prefix'], $counts);
+    scan_db_options($db, $config['prefix'], $root, $counts);
+    scan_db_posts($db, $config['prefix'], $counts);
+
+    mysqli_close($db);
+
+    emit_summary('database', $counts,
+        'Database scan complete: ' . $counts['ADMINS'] . ' administrator(s), ' . $counts['OPTIONS'] . ' options scanned, '
+        . $counts['FLAGGED_OPTIONS'] . ' flagged options, ' . $counts['FLAGGED_POSTS'] . " flagged posts\n");
+}
+
 function check_prepend_directives($root, $config_path, &$counts)
 {
     ///////////////
@@ -1718,7 +2050,7 @@ function cleanup_util($file_buffer, $file_path)
 
 function lint_signatures()
 {
-    global $CLEANUP_SIGNATURES, $CRONTAB_SIGS, $ACCESS_LOG_SIGS;
+    global $CLEANUP_SIGNATURES, $CRONTAB_SIGS, $ACCESS_LOG_SIGS, $DB_OPTION_SIGS, $DB_POST_SIGS;
 
     ///////////////
     // A malformed signature would otherwise silently never match. Stop the
@@ -1769,6 +2101,15 @@ function lint_signatures()
         if ( false === @preg_match($signature['pattern'], '') )
         {
             echo 'Invalid regex in access log signature ' . $signature['name'] . ': ' . $signature['pattern'] . "\n";
+            exit(1);
+        }
+    }
+
+    foreach ( array_merge($DB_OPTION_SIGS, $DB_POST_SIGS) as $signature )
+    {
+        if ( false === @preg_match($signature['pattern'], '') )
+        {
+            echo 'Invalid regex in database signature ' . $signature['name'] . ': ' . $signature['pattern'] . "\n";
             exit(1);
         }
     }
@@ -1826,7 +2167,7 @@ lint_signatures();
 // asking for more than one is an error instead.
 ///////////
 $requested_modes = array();
-foreach (array('scanall', 'scancron', 'scanlog', 'scanintegrity', 'scantimes', 'quickscan') as $mode) {
+foreach (array('scanall', 'scancron', 'scanlog', 'scanintegrity', 'scantimes', 'quickscan', 'scandb') as $mode) {
     if (isset($_GET[$mode])) {
         $requested_modes[] = $mode;
     }
@@ -1873,6 +2214,11 @@ if ( isset($_GET['scantimes']) ) {
 
 if ( isset($_GET['quickscan']) ) {
     scanQuick($_GET['scandirectory']);
+    scan_exit();
+}
+
+if ( isset($_GET['scandb']) ) {
+    scanDatabase(require_wordpress_root($_GET['scandirectory']), true);
     scan_exit();
 }
 
@@ -1969,6 +2315,8 @@ function scanAll()
     scanTimestamps($root);
     progress("== Crontab ==\n");
     scanCronTab();
+    progress("== Database ==\n");
+    scanDatabase($root, false);
     if (isset($_GET['scanlog'])) {
         progress("== Access logs ==\n");
         $flagged_minutes = scanLogTarget($_GET['scanlog']);
