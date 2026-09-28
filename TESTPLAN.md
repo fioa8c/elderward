@@ -120,6 +120,43 @@ Expect one new finding: `MEDIUM,TIMESTAMP_TIMESTOMP,...zz-stomp.php,theme ...: c
 
 ---
 
+## D. Phase 3 — correlation and restore (live)
+
+**D1. Log-to-file correlation.** Reuses A4's log (timestamps are UTC, so create the file's mtime in UTC too):
+
+```sh
+echo "<?php // planted" > $WP/zz-corr.php
+TZ=UTC touch -t 202609201006 $WP/zz-corr.php
+$EW scanlog=/tmp/ew/access.log correlate=1 scandirectory=$WP
+```
+
+Expect: the usual LOG_IOC report, then `HIGH,LOG_FILE_CORRELATION,...zz-corr.php,modified ... within 300s of flagged traffic: access.uploads.php ...` with the example request line, and `Correlation complete: 1 file(s)...`. No other file in the tree should correlate. Clean up: `rm $WP/zz-corr.php`.
+
+**D2. Plugin restore (live download).**
+
+```sh
+echo "// tampered" >> $WP/wp-content/plugins/akismet/akismet.php
+rm $WP/wp-content/plugins/akismet/index.php
+$EW scanintegrity=1 restore=1 dryrun=1 scandirectory=$WP        # preview
+$EW scanintegrity=1 restore=1 quarantinedir=/tmp/ew/quarantine scandirectory=$WP
+$EW scanintegrity=1 scandirectory=$WP                            # rescan
+ls -R /tmp/ew/quarantine
+```
+
+Expect: preview reports two `INFO,INTEGRITY_RESTORABLE` and changes nothing; the real run reports two `INFO,INTEGRITY_RESTORED`; the rescan comes back `0 modified, 0 missing, 0 extra`; the quarantine dir holds `plugin-akismet-<ver>/akismet.php.quarantine` containing your `// tampered` line (only the modified file — the deleted one had nothing to preserve). **PASTE if it differs.**
+
+**D3. Core restore (live download, ~30 MB).**
+
+```sh
+echo "// tampered" >> $WP/wp-includes/functions.php
+$EW scanintegrity=1 restore=1 quarantinedir=/tmp/ew/quarantine scandirectory=$WP
+$EW scanintegrity=1 scandirectory=$WP
+```
+
+Expect: `INFO,INTEGRITY_RESTORED,...functions.php,core <ver>: pristine copy restored...` and a clean rescan. This is the one live path with no offline equivalent tested (the full core zip download + `wordpress/` prefix extraction), so **PASTE the output either way.**
+
+---
+
 ## What to paste back
 
 1. B1 output (always), B4/C4 outputs if you can run them (always), `php -v` and the OS.

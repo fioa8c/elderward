@@ -23,7 +23,10 @@ php elderward.php scanlog=/var/log/apache2/access.log   # scan one access log fo
 php elderward.php scanlog=/var/log/apache2 # scan every access log in a directory (.gz included)
 php elderward.php scanintegrity=1 scandirectory=/path/to/wp-root   # verify core + plugins
 php elderward.php scanintegrity=1 checksumdir=/path/to/manifests   # ... without network access
+php elderward.php scanintegrity=1 restore=1 dryrun=1 scandirectory=/path/to/wp-root  # preview restore
+php elderward.php scanintegrity=1 restore=1 quarantinedir=/safe/place scandirectory=/path/to/wp-root
 php elderward.php scantimes=1 scandirectory=/path/to/wp-root       # timestamp anomaly report
+php elderward.php scanlog=/var/log/apache2 correlate=1 scandirectory=/path/to/wp-root  # link traffic to files
 php elderward.php help=1                   # show usage
 ```
 
@@ -62,10 +65,20 @@ Delete the file from the server when you're done.
 
 - **Files** — signature-based detection and cleanup of known malware injections (e.g. the `ndsw`/`ndsx` and `wqpq` JavaScript campaigns), across common web extensions (`php`, `js`, `html`, ...). Cleaned files are written atomically (temp file + rename) so a failed write can never truncate the original.
 - **Crontab** — known persistence patterns (piped base64 decoders, pastebin downloads, tmp-dir droppers).
-- **Access logs** — known attack traffic: webshell requests, PHP files served from `wp-content/uploads`, wp-file-manager / Slider Revolution / TimThumb exploit attempts, `.env` probes, directory traversal, code and PHP-CGI injection, user enumeration, and xmlrpc/wp-login brute-force floods.
+- **Access logs** — known attack traffic: webshell requests, PHP files served from `wp-content/uploads`, wp-file-manager / Slider Revolution / TimThumb exploit attempts, `.env` probes, directory traversal, code and PHP-CGI injection, user enumeration, and xmlrpc/wp-login brute-force floods. Add `correlate=1` (with `scandirectory=`) to also report files whose mtime falls within `window=` seconds (default 300) of flagged traffic — `LOG_FILE_CORRELATION`, the "this request created that file" artifact. A hit is a strong lead; a miss clears nothing, since later edits or faked mtimes erase the link.
 - **Integrity** (`scanintegrity=1`) — verifies WordPress core and every plugin against the official wordpress.org checksums for the installed version. Reports `INTEGRITY_MODIFIED` (checksum mismatch), `INTEGRITY_MISSING` (file from the package gone), and `INTEGRITY_EXTRA` (file on disk that the package doesn't contain — extra PHP inside core or a plugin is the classic dropped webshell and reports as `HIGH`). Packages that can't be verified (custom/premium plugins, versions not in the archive) report as `INTEGRITY_NO_REFERENCE`, so a clean report never silently means "unchecked". Bundled themes/plugins under `wp-content` are skipped in the core pass (plugins are verified individually), `wp-config.php` is ignored, and themes are not covered yet — wordpress.org publishes no theme checksums.
 
 - **Timestamps** (`scantimes=1`) — report-only heuristics for when files were touched apart from their package. Every check is an outlier *within* one package (core, a plugin, a theme), never a comparison against a site-wide date, which would drown in false positives after any migration. `TIMESTAMP_OUTLIER` flags a handful of files modified after the package's dominant install/update cluster (the classic backdoored `functions.php` or dropped loader); a large newer cluster is a legitimate update and doesn't flag. `TIMESTAMP_TIMESTOMP` flags PHP files whose mtime sits far behind their ctime — `touch -t` can back-date content time, but the inode change time can't be set without root — and only when few files in the package show it, since migrations and `rsync -a` do that to whole trees. Timestamps are leads, not proof: attackers fake them and updates rewrite them, so these findings never feed a cleanup action and a clean result does not clear a file.
+
+### Restoring files (`restore=1`)
+
+With `scanintegrity=1 restore=1`, every `INTEGRITY_MODIFIED` and `INTEGRITY_MISSING` file is restored from the official package zip for the exact installed version. Safety properties:
+
+- **Take a backup first**, and preview with `dryrun=1` (reports `INTEGRITY_RESTORABLE` without writing).
+- Every file is **byte-verified against the reference checksum manifest before writing** — a tampered or mismatched zip is refused (`RESTORE_FAILED`), never written.
+- `EXTRA` files are **never touched**: deleting unknown files is the operator's call.
+- Overwriting a backdoored file destroys evidence. Set `quarantinedir=/path` (outside the webroot) to copy each original aside as `*.quarantine` before it's overwritten; if quarantining fails, the file is left alone.
+- Offline: with `checksumdir=`, package zips are read as `core-{version}.zip` / `plugin-{slug}-{version}.zip` from the same directory. Non-`en_US` core restore isn't supported yet (plugin restore is locale-independent).
 
 ### Integrity checks without network access
 

@@ -71,6 +71,13 @@ if (isset($_GET['help'])) {
     echo "  checksumdir=/path     Use pre-downloaded checksum manifests instead of the network\n";
     echo "                        (core-{version}.json, plugin-{slug}-{version}.json)\n";
     echo "  locale=xx_XX          Core locale for the checksum lookup (default: en_US)\n";
+    echo "  restore=1             With scanintegrity: restore MODIFIED and MISSING files from\n";
+    echo "                        the official package zips (byte-verified against the checksum\n";
+    echo "                        manifest before writing; honors dryrun=1). EXTRA files are\n";
+    echo "                        never touched. Take a backup first.\n";
+    echo "  quarantinedir=/path   With restore: copy each original aside (as *.quarantine)\n";
+    echo "                        before overwriting, preserving evidence. Keep it outside\n";
+    echo "                        the webroot.\n";
     echo "  scantimes=1           Report timestamp anomalies (files modified apart from their\n";
     echo "                        package, possible faked mtimes). Report-only heuristics.\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
@@ -97,6 +104,10 @@ function write_cleaned_file($file_path, $cleaned_conent)
     $perms = @fileperms($file_path);
     if (false !== $perms) {
         @chmod($tmp_path, $perms & 0777);
+    } else {
+        // No existing target (restoring a deleted file): 0600 would be
+        // unreadable to the web server.
+        @chmod($tmp_path, 0644);
     }
 
     if (!@rename($tmp_path, $file_path)) {
@@ -691,17 +702,20 @@ function verify_against_manifest($base_dir, $manifest, $label, $present_files, &
     // disk that the official package does not contain (EXTRA). Extra or
     // modified PHP is the classic dropped/backdoored webshell: HIGH.
     //////////////
+    $restorable = array();
     foreach ($manifest as $relative_path => $expected) {
         $full_path = $base_dir . '/' . $relative_path;
         if (!is_file($full_path)) {
             report_finding('LOW', 'INTEGRITY_MISSING', $full_path, $label . ': file from the official package is missing');
             $totals['MISSING']++;
+            $restorable[] = array('rel' => $relative_path, 'expected' => $expected);
             continue;
         }
         if (null === $expected || !file_checksum_matches($full_path, $expected)) {
             $severity = is_php_file($relative_path) ? 'HIGH' : 'MEDIUM';
             report_finding($severity, 'INTEGRITY_MODIFIED', $full_path, $label . ': checksum does not match the official package');
             $totals['MODIFIED']++;
+            $restorable[] = array('rel' => $relative_path, 'expected' => $expected);
         }
     }
 
@@ -711,6 +725,153 @@ function verify_against_manifest($base_dir, $manifest, $label, $present_files, &
             report_finding($severity, 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': file is not part of the official package');
             $totals['EXTRA']++;
         }
+    }
+
+    // MODIFIED and MISSING files can be restored from the official package
+    // zip; EXTRA files are never touched - deleting unknown files is the
+    // operator's call, not this tool's.
+    return ($restorable);
+}
+
+function http_get_file($url, $dest)
+{
+    // Package zips can be tens of MB: stream to disk instead of buffering.
+    if (function_exists('curl_init')) {
+        $fh = @fopen($dest, 'w');
+        if (false === $fh) {
+            return (false);
+        }
+        $ch = curl_init($url);
+        curl_setopt_array($ch, array(
+            CURLOPT_FILE           => $fh,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 3,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT        => 300,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_USERAGENT      => 'elderward',
+        ));
+        $ok = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        fclose($fh);
+        return (false !== $ok && 200 === $status);
+    }
+
+    list($status, $body) = http_get($url);
+    if (200 !== $status) {
+        return (false);
+    }
+    return (strlen($body) === @file_put_contents($dest, $body));
+}
+
+function quarantine_original($target, $relative_path, $label)
+{
+    ///////////////
+    // Overwriting a backdoored file destroys the evidence an IR needs.
+    // With quarantinedir= set, the original is copied there first, with a
+    // .quarantine suffix so nothing serves or executes it.
+    //////////////
+    $quarantine_root = rtrim($_GET['quarantinedir'], '/') . '/' . str_replace(' ', '-', $label);
+    $dest = $quarantine_root . '/' . $relative_path . '.quarantine';
+    $dest_dir = dirname($dest);
+    if (!is_dir($dest_dir) && !@mkdir($dest_dir, 0700, true)) {
+        return (false);
+    }
+    return (@copy($target, $dest));
+}
+
+function restore_package_files($base_dir, $zip_url, $offline_zip_name, $zip_prefix, $items, $label)
+{
+    if (!class_exists('ZipArchive')) {
+        report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': PHP zip extension not available, cannot restore');
+        return;
+    }
+
+    ///////////////
+    // Fetch the official package zip: from checksumdir when offline,
+    // otherwise downloaded to a temp file and removed afterwards.
+    //////////////
+    $is_temp = false;
+    if (isset($_GET['checksumdir'])) {
+        $zip_path = rtrim($_GET['checksumdir'], '/') . '/' . $offline_zip_name;
+        if (!is_file($zip_path)) {
+            report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': package zip ' . $offline_zip_name . ' not found in checksumdir');
+            return;
+        }
+    } else {
+        $zip_path = @tempnam(sys_get_temp_dir(), 'elderward-zip');
+        if (false === $zip_path || !http_get_file($zip_url, $zip_path)) {
+            report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': could not download the official package (' . $zip_url . ')');
+            if (false !== $zip_path) {
+                @unlink($zip_path);
+            }
+            return;
+        }
+        $is_temp = true;
+    }
+
+    $zip = new ZipArchive();
+    if (true !== $zip->open($zip_path)) {
+        report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': could not open the package zip');
+        if ($is_temp) {
+            @unlink($zip_path);
+        }
+        return;
+    }
+
+    foreach ($items as $item) {
+        $target = $base_dir . '/' . $item['rel'];
+
+        $content = $zip->getFromName($zip_prefix . $item['rel']);
+        if (false === $content) {
+            report_finding('ERROR', 'RESTORE_FAILED', $target, $label . ': file not found inside the package zip');
+            continue;
+        }
+
+        ///////////////
+        // Only byte-verified content is ever written: the packaged file must
+        // match the reference manifest, so a tampered zip (or a manifest/zip
+        // version mix-up) can never plant content.
+        //////////////
+        $content_matches = false;
+        $content_md5 = md5($content);
+        foreach ((array) $item['expected'] as $candidate) {
+            if (null !== $candidate && hash_equals(strtolower((string) $candidate), $content_md5)) {
+                $content_matches = true;
+            }
+        }
+        if (!$content_matches) {
+            report_finding('ERROR', 'RESTORE_FAILED', $target, $label . ': packaged file does not match the reference checksum, refusing to restore');
+            continue;
+        }
+
+        if (isset($_GET['dryrun'])) {
+            report_finding('INFO', 'INTEGRITY_RESTORABLE', $target, $label . ' (dry run: not restored)');
+            continue;
+        }
+
+        if (isset($_GET['quarantinedir']) && is_file($target) && !quarantine_original($target, $item['rel'], $label)) {
+            report_finding('ERROR', 'RESTORE_FAILED', $target, $label . ': could not quarantine the original, refusing to overwrite it');
+            continue;
+        }
+
+        $target_dir = dirname($target);
+        if (!is_dir($target_dir) && !@mkdir($target_dir, 0755, true)) {
+            report_finding('ERROR', 'RESTORE_FAILED', $target, $label . ': could not create the target directory');
+            continue;
+        }
+        if (!write_cleaned_file($target, $content)) {
+            report_finding('ERROR', 'RESTORE_FAILED', $target, $label . ': could not write the restored file');
+            continue;
+        }
+        report_finding('INFO', 'INTEGRITY_RESTORED', $target, $label . ': pristine copy restored from the official package');
+    }
+
+    $zip->close();
+    if ($is_temp) {
+        @unlink($zip_path);
     }
 }
 
@@ -740,6 +901,14 @@ function scanIntegrity($root)
     }
 
     $totals = array('MODIFIED' => 0, 'MISSING' => 0, 'EXTRA' => 0, 'NO_REFERENCE' => 0);
+
+    if (isset($_GET['quarantinedir'])) {
+        $quarantine_real = @realpath($_GET['quarantinedir']);
+        $root_real = @realpath($root);
+        if (false !== $quarantine_real && false !== $root_real && 0 === strpos($quarantine_real . '/', $root_real . '/')) {
+            echo "Warning: quarantinedir is inside the scanned tree - move it outside the webroot so quarantined files cannot be served.\n";
+        }
+    }
 
     ///////////////
     // Core: checksums come per version+locale. Bundled themes/plugins under
@@ -785,7 +954,17 @@ function scanIntegrity($root)
                     $present[] = basename($root_file);
                 }
             }
-            verify_against_manifest($root, $manifest, 'core ' . $wp_version, $present, $totals);
+            $restorable = verify_against_manifest($root, $manifest, 'core ' . $wp_version, $present, $totals);
+            if (isset($_GET['restore']) && count($restorable) > 0) {
+                if ('en_US' !== $locale) {
+                    echo "Restore of non-en_US core packages is not supported yet; skipping core restore.\n";
+                } else {
+                    restore_package_files($root,
+                        'https://wordpress.org/wordpress-' . rawurlencode($wp_version) . '.zip',
+                        'core-' . $wp_version . '.zip',
+                        'wordpress/', $restorable, 'core ' . $wp_version);
+                }
+            }
         }
     }
 
@@ -824,7 +1003,13 @@ function scanIntegrity($root)
         foreach ($data['files'] as $relative_path => $sums) {
             $manifest[$relative_path] = isset($sums['md5']) ? $sums['md5'] : null;
         }
-        verify_against_manifest($plugin_dir, $manifest, 'plugin ' . $slug . ' ' . $version, list_files_recursive($plugin_dir, $plugin_dir), $totals);
+        $restorable = verify_against_manifest($plugin_dir, $manifest, 'plugin ' . $slug . ' ' . $version, list_files_recursive($plugin_dir, $plugin_dir), $totals);
+        if (isset($_GET['restore']) && count($restorable) > 0) {
+            restore_package_files($plugin_dir,
+                'https://downloads.wordpress.org/plugin/' . rawurlencode($slug) . '.' . rawurlencode($version) . '.zip',
+                'plugin-' . $slug . '-' . $version . '.zip',
+                $slug . '/', $restorable, 'plugin ' . $slug . ' ' . $version);
+        }
     }
 
     // Single-file plugins (e.g. hello.php) sit directly in the plugins dir
