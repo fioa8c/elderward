@@ -744,8 +744,14 @@ function verify_against_manifest($base_dir, $manifest, $label, $present_files, &
             if ($known_benign) {
                 report_finding('INFO', 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': ' . $INTEGRITY_KNOWN_BENIGN[$basename]);
             } else {
+                $detail = $label . ': file is not part of the official package';
+                // Hex-named PHP at the docroot is used both by dropped
+                // webshells and by migration/backup tooling: say so.
+                if (preg_match('/^[0-9a-f]{32,64}\.php$/i', $basename)) {
+                    $detail .= ' (hex-named PHP is dropped by webshells AND by migration/backup tools such as BlogVault/MalCare or Duplicator - inspect the contents)';
+                }
                 $severity = is_php_file($relative_path) ? 'HIGH' : 'LOW';
-                report_finding($severity, 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': file is not part of the official package');
+                report_finding($severity, 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $detail);
             }
             $totals['EXTRA']++;
         }
@@ -760,10 +766,11 @@ function verify_against_manifest($base_dir, $manifest, $label, $present_files, &
 function http_get_file($url, $dest)
 {
     // Package zips can be tens of MB: stream to disk instead of buffering.
+    // Returns the HTTP status code (0 on transport failure).
     if (function_exists('curl_init')) {
         $fh = @fopen($dest, 'w');
         if (false === $fh) {
-            return (false);
+            return (0);
         }
         $ch = curl_init($url);
         curl_setopt_array($ch, array(
@@ -780,14 +787,71 @@ function http_get_file($url, $dest)
         $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
         fclose($fh);
-        return (false !== $ok && 200 === $status);
+        return ((false !== $ok) ? $status : 0);
     }
 
     list($status, $body) = http_get($url);
     if (200 !== $status) {
-        return (false);
+        return ($status);
     }
-    return (strlen($body) === @file_put_contents($dest, $body));
+    return ((strlen($body) === @file_put_contents($dest, $body)) ? 200 : 0);
+}
+
+function acquire_package_zip($zip_url, $offline_zip_name)
+{
+    ///////////////
+    // Returns array($zip_path_or_null, $is_temp, $status) with $status one
+    // of 'ok', 'notfound', 'error'. With checksumdir= the zip is read from
+    // there instead of the network, mirroring the manifest naming.
+    //////////////
+    if (isset($_GET['checksumdir'])) {
+        $zip_path = rtrim($_GET['checksumdir'], '/') . '/' . $offline_zip_name;
+        if (is_file($zip_path)) {
+            return array($zip_path, false, 'ok');
+        }
+        return array(null, false, 'notfound');
+    }
+
+    $zip_path = @tempnam(sys_get_temp_dir(), 'elderward-zip');
+    if (false === $zip_path) {
+        return array(null, false, 'error');
+    }
+    $status = http_get_file($zip_url, $zip_path);
+    if (200 !== $status) {
+        @unlink($zip_path);
+        return array(null, false, (404 === $status) ? 'notfound' : 'error');
+    }
+    return array($zip_path, true, 'ok');
+}
+
+function manifest_from_zip($zip_path, $zip_prefix)
+{
+    ///////////////
+    // Themes have no checksum API, so the reference manifest is built by
+    // hashing the official package zip's own contents.
+    //////////////
+    if (!class_exists('ZipArchive')) {
+        return (null);
+    }
+    $zip = new ZipArchive();
+    if (true !== $zip->open($zip_path)) {
+        return (null);
+    }
+
+    $manifest = array();
+    for ($i = 0; $i < $zip->numFiles; $i++) {
+        $entry_name = $zip->getNameIndex($i);
+        if (0 !== strpos($entry_name, $zip_prefix) || '/' === substr($entry_name, -1)) {
+            continue;
+        }
+        $content = $zip->getFromIndex($i);
+        if (false === $content) {
+            continue;
+        }
+        $manifest[substr($entry_name, strlen($zip_prefix))] = md5($content);
+    }
+    $zip->close();
+    return ($manifest);
 }
 
 function quarantine_original($target, $relative_path, $label)
@@ -813,35 +877,24 @@ function restore_package_files($base_dir, $zip_url, $offline_zip_name, $zip_pref
         return;
     }
 
-    ///////////////
-    // Fetch the official package zip: from checksumdir when offline,
-    // otherwise downloaded to a temp file and removed afterwards.
-    //////////////
-    $is_temp = false;
-    if (isset($_GET['checksumdir'])) {
-        $zip_path = rtrim($_GET['checksumdir'], '/') . '/' . $offline_zip_name;
-        if (!is_file($zip_path)) {
-            report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': package zip ' . $offline_zip_name . ' not found in checksumdir');
-            return;
-        }
-    } else {
-        $zip_path = @tempnam(sys_get_temp_dir(), 'elderward-zip');
-        if (false === $zip_path || !http_get_file($zip_url, $zip_path)) {
-            report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': could not download the official package (' . $zip_url . ')');
-            if (false !== $zip_path) {
-                @unlink($zip_path);
-            }
-            return;
-        }
-        $is_temp = true;
+    list($zip_path, $is_temp, $status) = acquire_package_zip($zip_url, $offline_zip_name);
+    if ('ok' !== $status) {
+        report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': could not obtain the official package (' . $status . ')');
+        return;
     }
 
+    restore_items_from_zip($zip_path, $zip_prefix, $base_dir, $items, $label);
+
+    if ($is_temp) {
+        @unlink($zip_path);
+    }
+}
+
+function restore_items_from_zip($zip_path, $zip_prefix, $base_dir, $items, $label)
+{
     $zip = new ZipArchive();
     if (true !== $zip->open($zip_path)) {
         report_finding('ERROR', 'RESTORE_FAILED', $base_dir, $label . ': could not open the package zip');
-        if ($is_temp) {
-            @unlink($zip_path);
-        }
         return;
     }
 
@@ -894,9 +947,18 @@ function restore_package_files($base_dir, $zip_url, $offline_zip_name, $zip_pref
     }
 
     $zip->close();
-    if ($is_temp) {
-        @unlink($zip_path);
+}
+
+function read_theme_version($theme_dir)
+{
+    $header = @file_get_contents($theme_dir . '/style.css', false, null, 0, 8192);
+    if (false === $header || false === stripos($header, 'Theme Name:')) {
+        return (null);
     }
+    if (preg_match('/^[ \t\/*#@]*Version:\s*(\S+)/mi', $header, $matches)) {
+        return trim($matches[1]);
+    }
+    return (null);
 }
 
 function read_plugin_version($plugin_dir)
@@ -1033,6 +1095,58 @@ function scanIntegrity($root)
                 'https://downloads.wordpress.org/plugin/' . rawurlencode($slug) . '.' . rawurlencode($version) . '.zip',
                 'plugin-' . $slug . '-' . $version . '.zip',
                 $slug . '/', $restorable, 'plugin ' . $slug . ' ' . $version);
+        }
+    }
+
+    ///////////////
+    // Themes: wordpress.org publishes no theme checksums, so the reference
+    // manifest is built by hashing the official package zip's contents.
+    // Custom, premium, and child themes 404 there: NO_REFERENCE.
+    //////////////
+    $themes_dir = $root . '/wp-content/themes';
+    $theme_dirs = (array) @glob($themes_dir . '/*', GLOB_ONLYDIR);
+    if (count($theme_dirs) > 0 && !class_exists('ZipArchive')) {
+        report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $themes_dir, 'themes: PHP zip extension not available, cannot verify themes');
+        $totals['NO_REFERENCE']++;
+    } elseif (count($theme_dirs) > 0) {
+        foreach ($theme_dirs as $theme_dir) {
+            $slug = basename($theme_dir);
+            $version = read_theme_version($theme_dir);
+            if (null === $version) {
+                report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $theme_dir, 'theme ' . $slug . ': could not determine the installed version');
+                $totals['NO_REFERENCE']++;
+                continue;
+            }
+
+            list($zip_path, $is_temp, $status) = acquire_package_zip(
+                'https://downloads.wordpress.org/theme/' . rawurlencode($slug) . '.' . rawurlencode($version) . '.zip',
+                'theme-' . $slug . '-' . $version . '.zip'
+            );
+            if ('notfound' === $status) {
+                report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $theme_dir, 'theme ' . $slug . ' ' . $version . ': not in the wordpress.org theme directory (custom/premium/child theme, or version not archived)');
+                $totals['NO_REFERENCE']++;
+                continue;
+            }
+            if ('ok' !== $status) {
+                report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $theme_dir, 'theme ' . $slug . ' ' . $version . ': could not fetch the official theme package');
+                $totals['NO_REFERENCE']++;
+                continue;
+            }
+
+            $manifest = manifest_from_zip($zip_path, $slug . '/');
+            if (null === $manifest || 0 === count($manifest)) {
+                report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $theme_dir, 'theme ' . $slug . ' ' . $version . ': could not read the official theme package');
+                $totals['NO_REFERENCE']++;
+            } else {
+                echo 'Checking theme ' . $slug . ' ' . $version . ' (' . count($manifest) . " files)\n";
+                $restorable = verify_against_manifest($theme_dir, $manifest, 'theme ' . $slug . ' ' . $version, list_files_recursive($theme_dir, $theme_dir), $totals);
+                if (isset($_GET['restore']) && count($restorable) > 0) {
+                    restore_items_from_zip($zip_path, $slug . '/', $theme_dir, $restorable, 'theme ' . $slug . ' ' . $version);
+                }
+            }
+            if ($is_temp) {
+                @unlink($zip_path);
+            }
         }
     }
 
