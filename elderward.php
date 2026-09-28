@@ -694,8 +694,20 @@ function list_files_recursive($dir, $base)
     return $relative_paths;
 }
 
+///////////////
+// Extra files that are commonly legitimate, keyed by basename. They still
+// report (an attacker can hide behind a known name) but as INFO with the
+// reason, so HIGH/MEDIUM triage stays clean.
+//////////////
+$INTEGRITY_KNOWN_BENIGN = array(
+    'error_log'         => 'PHP error log created by the hosting stack - not malware, but worth reading for attack traces',
+    'php_errorlog'      => 'PHP error log created by the hosting stack - not malware, but worth reading for attack traces',
+    'wordfence-waf.php' => 'Wordfence extended protection bootstrap (auto_prepend_file) - verify it only loads wordfence/waf/bootstrap.php',
+);
+
 function verify_against_manifest($base_dir, $manifest, $label, $present_files, &$totals)
 {
+    global $INTEGRITY_KNOWN_BENIGN;
     ///////////////
     // $manifest maps package-relative paths to expected md5(s). Report
     // mismatches (MODIFIED), files gone from disk (MISSING), and files on
@@ -721,8 +733,20 @@ function verify_against_manifest($base_dir, $manifest, $label, $present_files, &
 
     foreach ($present_files as $relative_path) {
         if (!isset($manifest[$relative_path])) {
-            $severity = is_php_file($relative_path) ? 'HIGH' : 'LOW';
-            report_finding($severity, 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': file is not part of the official package');
+            $basename = basename($relative_path);
+            $known_benign = isset($INTEGRITY_KNOWN_BENIGN[$basename]);
+            // wordfence-waf.php is only expected where Wordfence is installed;
+            // anywhere else the name is camouflage.
+            if ($known_benign && 'wordfence-waf.php' === $basename && !is_dir($base_dir . '/wp-content/plugins/wordfence')) {
+                $known_benign = false;
+            }
+
+            if ($known_benign) {
+                report_finding('INFO', 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': ' . $INTEGRITY_KNOWN_BENIGN[$basename]);
+            } else {
+                $severity = is_php_file($relative_path) ? 'HIGH' : 'LOW';
+                report_finding($severity, 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': file is not part of the official package');
+            }
             $totals['EXTRA']++;
         }
     }
