@@ -63,6 +63,9 @@ if (isset($_GET['help'])) {
     echo "  scancron=1            Scan the current user's crontab for known malicious entries\n";
     echo "  scanlog=/path         Scan an access log (file or directory of logs, .gz supported)\n";
     echo "                        for known indicators of compromise, then exit\n";
+    echo "  correlate=1           With scanlog: also report files under scandirectory whose\n";
+    echo "                        mtime falls within window (default 300s) of flagged traffic\n";
+    echo "  window=seconds        Correlation window around flagged requests (min 60)\n";
     echo "  scanintegrity=1       Verify core and plugin files against wordpress.org checksums.\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
     echo "  checksumdir=/path     Use pre-downloaded checksum manifests instead of the network\n";
@@ -309,6 +312,28 @@ $ACCESS_LOG_SIGS = array(
     ),
 );
 
+function parse_log_timestamp($line)
+{
+    // Common/combined log format: [20/Sep/2026:10:05:01 +0000]
+    if (!preg_match('@\[(\d{1,2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2} [+-]\d{4})\]@', $line, $matches)) {
+        return (null);
+    }
+    $parsed = DateTime::createFromFormat('d/M/Y:H:i:s O', $matches[1]);
+    return (false === $parsed) ? null : $parsed->getTimestamp();
+}
+
+function merge_flagged_minutes(&$into, $from)
+{
+    foreach ($from as $minute => $bucket) {
+        if (!isset($into[$minute])) {
+            $into[$minute] = $bucket;
+            continue;
+        }
+        $into[$minute]['count'] += $bucket['count'];
+        $into[$minute]['names'] = array_merge($into[$minute]['names'], $bucket['names']);
+    }
+}
+
 function scanAccessLog($log_path)
 {
     global $ACCESS_LOG_SIGS;
@@ -321,13 +346,13 @@ function scanAccessLog($log_path)
     $is_gzipped = ('gz' === strtolower(pathinfo($log_path, PATHINFO_EXTENSION)));
     if ($is_gzipped && !function_exists('gzopen')) {
         echo 'Error: zlib not available, skipping compressed log ' . $log_path . "\n";
-        return;
+        return (array());
     }
 
     $fh = $is_gzipped ? @gzopen($log_path, 'r') : @fopen($log_path, 'r');
     if (false === $fh) {
         echo 'Error reading ' . $log_path . "\n";
-        return;
+        return (array());
     }
 
     $max_examples = 5;
@@ -335,6 +360,9 @@ function scanAccessLog($log_path)
     $hit_counts = array();
     $hit_examples = array();
     $hit_ips = array();
+    // Per-signature, per-minute buckets of matched lines, kept for the
+    // correlate mode. Minute granularity bounds memory on flooded logs.
+    $hit_minutes = array();
 
     while (true) {
         // 8KB cap per read: an absurdly long line is scanned in chunks
@@ -367,6 +395,19 @@ function scanAccessLog($log_path)
                 $hit_ips[$name][$ip] = isset($hit_ips[$name][$ip]) ? $hit_ips[$name][$ip] + 1 : 1;
             }
 
+            $timestamp = parse_log_timestamp($line);
+            if (null !== $timestamp) {
+                $minute = $timestamp - ($timestamp % 60);
+                if (!isset($hit_minutes[$name][$minute])) {
+                    $hit_minutes[$name][$minute] = array(
+                        'count'   => 0,
+                        'names'   => array($name => true),
+                        'example' => substr(trim($line), 0, $max_example_length),
+                    );
+                }
+                $hit_minutes[$name][$minute]['count']++;
+            }
+
             // First matching IoC wins for this line.
             break;
         }
@@ -381,12 +422,16 @@ function scanAccessLog($log_path)
 
     $reported = 0;
     $reported_ips = array();
+    $flagged_minutes = array();
     foreach ($ACCESS_LOG_SIGS as $signature) {
         $name = $signature['name'];
         if (!isset($hit_counts[$name]) || $hit_counts[$name] < $signature['threshold']) {
             continue;
         }
         $reported++;
+        if (isset($hit_minutes[$name])) {
+            merge_flagged_minutes($flagged_minutes, $hit_minutes[$name]);
+        }
 
         $severity = isset($signature['severity']) ? $signature['severity'] : 'MEDIUM';
         report_finding($severity, 'LOG_IOC', $log_path, $name . ': ' . $hit_counts[$name] . ' hit(s) - ' . $signature['description']);
@@ -401,7 +446,7 @@ function scanAccessLog($log_path)
 
     if (0 === $reported) {
         echo "No known IoCs found.\n";
-        return;
+        return (array());
     }
 
     arsort($reported_ips);
@@ -409,13 +454,14 @@ function scanAccessLog($log_path)
     foreach (array_slice($reported_ips, 0, 10, true) as $ip => $count) {
         echo "    " . $ip . " (" . $count . " hits)\n";
     }
+
+    return ($flagged_minutes);
 }
 
 function scanLogTarget($target)
 {
     if (is_file($target)) {
-        scanAccessLog($target);
-        return;
+        return (scanAccessLog($target));
     }
 
     if (!is_dir($target) || !is_readable($target)) {
@@ -432,6 +478,7 @@ function scanLogTarget($target)
     $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
 
     $logs_found = 0;
+    $flagged_minutes = array();
     foreach ($files as $file) {
         $basename = $file->getFilename();
         if (preg_match('@error@i', $basename)) {
@@ -440,13 +487,81 @@ function scanLogTarget($target)
         if (preg_match('@(?:access[^/]*|\.log(?:\.\d+)?(?:\.gz)?)$@i', $basename) !== 1) {
             continue;
         }
-        scanAccessLog($file->getPathname());
+        merge_flagged_minutes($flagged_minutes, scanAccessLog($file->getPathname()));
         $logs_found++;
     }
 
     if (0 === $logs_found) {
         echo 'No access log files found in ' . $target . "\n";
     }
+    return ($flagged_minutes);
+}
+
+function correlate_files($root, $flagged_minutes, $window)
+{
+    global $extensions_to_check;
+
+    ///////////////
+    // The IR smoking gun: a file whose mtime falls inside the window around
+    // flagged attack traffic. Report-only - a hit is a strong lead, but a
+    // miss clears nothing (later edits and faked mtimes erase the link).
+    //////////////
+    if (empty($flagged_minutes)) {
+        echo "Correlation: no flagged log traffic to correlate against.\n";
+        return;
+    }
+    if (!is_dir($root) || !is_readable($root)) {
+        echo 'Error: cannot open correlation directory ' . $root . "\n";
+        exit(1);
+    }
+
+    $dir = new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS);
+    $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+
+    $correlated = 0;
+    foreach ($files as $file) {
+        if ($file->getRealPath() === __FILE__) {
+            continue;
+        }
+        $scannable_file = isset($_GET['scan_all'])
+            || in_array(strtolower($file->getExtension()), $extensions_to_check, true);
+        if (!$scannable_file) {
+            continue;
+        }
+
+        $mtime = @$file->getMTime();
+        if (false === $mtime) {
+            continue;
+        }
+
+        // Walk the minute buckets covering [mtime - window, mtime + window].
+        $in_window = array('count' => 0, 'names' => array(), 'example' => '');
+        $start = ($mtime - $window) - (($mtime - $window) % 60);
+        for ($minute = $start; $minute <= ($mtime + $window); $minute += 60) {
+            if (!isset($flagged_minutes[$minute])) {
+                continue;
+            }
+            $in_window['count'] += $flagged_minutes[$minute]['count'];
+            $in_window['names'] += $flagged_minutes[$minute]['names'];
+            if ('' === $in_window['example']) {
+                $in_window['example'] = $flagged_minutes[$minute]['example'];
+            }
+        }
+        if (0 === $in_window['count']) {
+            continue;
+        }
+
+        $path = $file->getPathname();
+        $severity = is_php_file($path) ? 'HIGH' : 'MEDIUM';
+        report_finding($severity, 'LOG_FILE_CORRELATION', $path,
+            'modified ' . date('Y-m-d H:i:s', $mtime) . ' within ' . $window . 's of flagged traffic: '
+            . implode(' ', array_keys($in_window['names'])) . ' (' . $in_window['count'] . ' flagged requests in window)');
+        echo '    e.g. ' . $in_window['example'] . "\n";
+        $correlated++;
+    }
+
+    echo 'Correlation complete: ' . $correlated . ' file(s) modified within ' . $window
+        . "s of flagged traffic. Later edits or faked mtimes erase this link - a miss clears nothing.\n";
 }
 
 ////////////////
@@ -1049,49 +1164,11 @@ function lint_signatures()
     }
 }
 
-lint_signatures();
-
-////////////
-// Standalone scan modes: neither needs a scan directory, so they run and
-// exit before the directory validation below.
-///////////
-if ( isset($_GET['scancron']) ) {
-    scanCronTab();
-    die();
-}
-
-if ( isset($_GET['scanlog']) ) {
-    scanLogTarget($_GET['scanlog']);
-    die();
-}
-
-if ( isset($_GET['scanintegrity']) ) {
-    scanIntegrity($_GET['scandirectory']);
-    die();
-}
-
-if ( isset($_GET['scantimes']) ) {
-    scanTimestamps($_GET['scandirectory']);
-    die();
-}
-
-////////////
-// using RecursiveDirectoryIterator and RecursiveIteratorIterator to crawl the directories
-// using SKIP_DOTS because it's not important
-///////////
-if (!is_dir($_GET['scandirectory']) || !is_readable($_GET['scandirectory'])) {
-    echo 'Error: cannot open scan directory ' . $_GET['scandirectory'] . "\n";
-    exit(1);
-}
-
-$dir = new RecursiveDirectoryIterator($_GET['scandirectory'], RecursiveDirectoryIterator::SKIP_DOTS);
-// CATCH_GET_CHILD: an unreadable subdirectory is skipped instead of aborting the whole walk.
-$files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
-
 ////////////
 // Defining our variables
 //    - $filesize_limit : Filesize limit to read is 2MB, but it can be better configured if we have an idea of how big are the php files we backup
-//    - $extensions_to_check : list of extensions we'll check for malware
+//    - $extensions_to_check : list of extensions we'll check for malware (also
+//      the files considered by the correlate mode)
 ///////////
 
 $filesize_limit = 2097152;
@@ -1130,6 +1207,54 @@ $extensions_to_check = array(
     'tmpl',
     'tpl',
 );
+
+lint_signatures();
+
+////////////
+// Standalone scan modes: neither needs a scan directory, so they run and
+// exit before the directory validation below.
+///////////
+if ( isset($_GET['correlate']) && !isset($_GET['scanlog']) ) {
+    echo "Error: correlate=1 needs scanlog=/path to know which traffic to correlate against\n";
+    exit(1);
+}
+
+if ( isset($_GET['scancron']) ) {
+    scanCronTab();
+    die();
+}
+
+if ( isset($_GET['scanlog']) ) {
+    $flagged_minutes = scanLogTarget($_GET['scanlog']);
+    if ( isset($_GET['correlate']) ) {
+        $window = isset($_GET['window']) ? max(60, (int) $_GET['window']) : 300;
+        correlate_files($_GET['scandirectory'], $flagged_minutes, $window);
+    }
+    die();
+}
+
+if ( isset($_GET['scanintegrity']) ) {
+    scanIntegrity($_GET['scandirectory']);
+    die();
+}
+
+if ( isset($_GET['scantimes']) ) {
+    scanTimestamps($_GET['scandirectory']);
+    die();
+}
+
+////////////
+// using RecursiveDirectoryIterator and RecursiveIteratorIterator to crawl the directories
+// using SKIP_DOTS because it's not important
+///////////
+if (!is_dir($_GET['scandirectory']) || !is_readable($_GET['scandirectory'])) {
+    echo 'Error: cannot open scan directory ' . $_GET['scandirectory'] . "\n";
+    exit(1);
+}
+
+$dir = new RecursiveDirectoryIterator($_GET['scandirectory'], RecursiveDirectoryIterator::SKIP_DOTS);
+// CATCH_GET_CHILD: an unreadable subdirectory is skipped instead of aborting the whole walk.
+$files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
 
 ///////////
 // iterating through the files collected
