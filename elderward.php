@@ -63,6 +63,11 @@ if (isset($_GET['help'])) {
     echo "  scancron=1            Scan the current user's crontab for known malicious entries\n";
     echo "  scanlog=/path         Scan an access log (file or directory of logs, .gz supported)\n";
     echo "                        for known indicators of compromise, then exit\n";
+    echo "  scanintegrity=1       Verify core and plugin files against wordpress.org checksums.\n";
+    echo "                        scandirectory must be the WordPress root (default: current dir)\n";
+    echo "  checksumdir=/path     Use pre-downloaded checksum manifests instead of the network\n";
+    echo "                        (core-{version}.json, plugin-{slug}-{version}.json)\n";
+    echo "  locale=xx_XX          Core locale for the checksum lookup (default: en_US)\n";
     echo "  help=1                Show this help\n";
     die();
 }
@@ -441,6 +446,283 @@ function scanLogTarget($target)
     }
 }
 
+////////////////
+//
+// Integrity checking against wordpress.org reference checksums
+//
+//////////////
+
+function http_get($url)
+{
+    // This tool runs on already-compromised hosts: never disable TLS
+    // verification, or the "all clean" answer can be attacker-supplied.
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, array(
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 3,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT        => 60,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_USERAGENT      => 'elderward',
+        ));
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        return array((false === $body) ? 0 : $status, (string) $body);
+    }
+
+    $context = stream_context_create(array('http' => array(
+        'timeout'       => 60,
+        'user_agent'    => 'elderward',
+        'ignore_errors' => true,
+    )));
+    $body = @file_get_contents($url, false, $context);
+    $status = 0;
+    if (isset($http_response_header) && is_array($http_response_header)) {
+        // With redirects the array holds several header blocks; the last
+        // status line is the one for the final response.
+        foreach ($http_response_header as $header_line) {
+            if (preg_match('@^HTTP/\S+\s(\d{3})@', $header_line, $matches)) {
+                $status = (int) $matches[1];
+            }
+        }
+    }
+    return array($status, (false === $body) ? '' : $body);
+}
+
+function fetch_reference_checksums($url, $offline_name)
+{
+    ///////////////
+    // checksumdir=/path switches to pre-downloaded manifests for hosts with
+    // no outbound network: {checksumdir}/{offline_name} holds the same JSON
+    // the wordpress.org API would have returned.
+    //////////////
+    if (isset($_GET['checksumdir'])) {
+        $offline_path = rtrim($_GET['checksumdir'], '/') . '/' . $offline_name;
+        if (!is_file($offline_path)) {
+            return array('notfound', null);
+        }
+        $body = @file_get_contents($offline_path);
+        if (false === $body) {
+            return array('error', null);
+        }
+    } else {
+        list($status, $body) = http_get($url);
+        if (404 === $status) {
+            return array('notfound', null);
+        }
+        if (200 !== $status || '' === $body) {
+            return array('error', null);
+        }
+    }
+
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded)) {
+        return array('error', null);
+    }
+    return array('ok', $decoded);
+}
+
+function is_php_file($path)
+{
+    return (preg_match('@\.(?:ph(?:p[34578]?|t|tml|ps)|inc)$@i', $path) === 1);
+}
+
+function file_checksum_matches($file_path, $expected)
+{
+    $actual = @md5_file($file_path);
+    if (false === $actual) {
+        return (false);
+    }
+    // The plugin checksum API returns a string, or an array of valid
+    // checksums when a release was ever repackaged.
+    foreach ((array) $expected as $candidate) {
+        if (hash_equals(strtolower((string) $candidate), $actual)) {
+            return (true);
+        }
+    }
+    return (false);
+}
+
+function list_files_recursive($dir, $base)
+{
+    $relative_paths = array();
+    $walker = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY,
+        RecursiveIteratorIterator::CATCH_GET_CHILD
+    );
+    $base_length = strlen(rtrim($base, '/')) + 1;
+    foreach ($walker as $file) {
+        if (!$file->isFile()) {
+            continue;
+        }
+        $relative_paths[] = str_replace('\\', '/', substr($file->getPathname(), $base_length));
+    }
+    return $relative_paths;
+}
+
+function verify_against_manifest($base_dir, $manifest, $label, $present_files, &$totals)
+{
+    ///////////////
+    // $manifest maps package-relative paths to expected md5(s). Report
+    // mismatches (MODIFIED), files gone from disk (MISSING), and files on
+    // disk that the official package does not contain (EXTRA). Extra or
+    // modified PHP is the classic dropped/backdoored webshell: HIGH.
+    //////////////
+    foreach ($manifest as $relative_path => $expected) {
+        $full_path = $base_dir . '/' . $relative_path;
+        if (!is_file($full_path)) {
+            report_finding('LOW', 'INTEGRITY_MISSING', $full_path, $label . ': file from the official package is missing');
+            $totals['MISSING']++;
+            continue;
+        }
+        if (null === $expected || !file_checksum_matches($full_path, $expected)) {
+            $severity = is_php_file($relative_path) ? 'HIGH' : 'MEDIUM';
+            report_finding($severity, 'INTEGRITY_MODIFIED', $full_path, $label . ': checksum does not match the official package');
+            $totals['MODIFIED']++;
+        }
+    }
+
+    foreach ($present_files as $relative_path) {
+        if (!isset($manifest[$relative_path])) {
+            $severity = is_php_file($relative_path) ? 'HIGH' : 'LOW';
+            report_finding($severity, 'INTEGRITY_EXTRA', $base_dir . '/' . $relative_path, $label . ': file is not part of the official package');
+            $totals['EXTRA']++;
+        }
+    }
+}
+
+function read_plugin_version($plugin_dir)
+{
+    // The main plugin file is whichever top-level PHP file carries the
+    // "Plugin Name:" header; its "Version:" header is the installed version.
+    foreach ((array) @glob($plugin_dir . '/*.php') as $candidate) {
+        $header = @file_get_contents($candidate, false, null, 0, 8192);
+        if (false === $header || false === stripos($header, 'Plugin Name:')) {
+            continue;
+        }
+        if (preg_match('/^[ \t\/*#@]*Version:\s*(\S+)/mi', $header, $matches)) {
+            return trim($matches[1]);
+        }
+    }
+    return (null);
+}
+
+function scanIntegrity($root)
+{
+    $root = rtrim($root, '/');
+    $version_file = $root . '/wp-includes/version.php';
+    if (!is_file($version_file)) {
+        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
+        exit(1);
+    }
+
+    $totals = array('MODIFIED' => 0, 'MISSING' => 0, 'EXTRA' => 0, 'NO_REFERENCE' => 0);
+
+    ///////////////
+    // Core: checksums come per version+locale. Bundled themes/plugins under
+    // wp-content are legitimately deleted all the time, so core manifest
+    // entries there are skipped (plugins are verified separately below).
+    // Extra-file detection covers wp-admin and wp-includes entirely, plus
+    // root-level PHP files (a classic dropper spot) except wp-config.php.
+    //////////////
+    $wp_version = null;
+    if (preg_match('/\$wp_version\s*=\s*\'([^\']+)\'/', (string) @file_get_contents($version_file), $matches)) {
+        $wp_version = $matches[1];
+    }
+    if (null === $wp_version) {
+        report_finding('ERROR', 'INTEGRITY_NO_REFERENCE', $version_file, 'could not read the core version');
+        $totals['NO_REFERENCE']++;
+    } else {
+        $locale = isset($_GET['locale']) ? $_GET['locale'] : 'en_US';
+        list($status, $data) = fetch_reference_checksums(
+            'https://api.wordpress.org/core/checksums/1.0/?version=' . rawurlencode($wp_version) . '&locale=' . rawurlencode($locale),
+            'core-' . $wp_version . '.json'
+        );
+        if ('ok' !== $status || empty($data['checksums']) || !is_array($data['checksums'])) {
+            report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $root, 'core ' . $wp_version . ' (' . $locale . '): no reference checksums available (' . $status . ')');
+            $totals['NO_REFERENCE']++;
+        } else {
+            echo 'Checking core ' . $wp_version . ' (' . count($data['checksums']) . " files)\n";
+            $manifest = array();
+            foreach ($data['checksums'] as $relative_path => $expected) {
+                if (0 === strpos($relative_path, 'wp-content/')) {
+                    continue;
+                }
+                $manifest[$relative_path] = $expected;
+            }
+
+            $present = array();
+            foreach (array('wp-admin', 'wp-includes') as $core_dir) {
+                if (is_dir($root . '/' . $core_dir)) {
+                    $present = array_merge($present, list_files_recursive($root . '/' . $core_dir, $root));
+                }
+            }
+            foreach ((array) @glob($root . '/*.php') as $root_file) {
+                if ('wp-config.php' !== basename($root_file)) {
+                    $present[] = basename($root_file);
+                }
+            }
+            verify_against_manifest($root, $manifest, 'core ' . $wp_version, $present, $totals);
+        }
+    }
+
+    ///////////////
+    // Plugins: one manifest per slug+version. A 404 means the plugin or the
+    // version is not in the wordpress.org archive (custom/premium plugin):
+    // reported as NO_REFERENCE so "clean" never silently means "unchecked".
+    //////////////
+    $plugins_dir = $root . '/wp-content/plugins';
+    foreach ((array) @glob($plugins_dir . '/*', GLOB_ONLYDIR) as $plugin_dir) {
+        $slug = basename($plugin_dir);
+        $version = read_plugin_version($plugin_dir);
+        if (null === $version) {
+            report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $plugin_dir, 'plugin ' . $slug . ': could not determine the installed version');
+            $totals['NO_REFERENCE']++;
+            continue;
+        }
+
+        list($status, $data) = fetch_reference_checksums(
+            'https://downloads.wordpress.org/plugin-checksums/' . rawurlencode($slug) . '/' . rawurlencode($version) . '.json',
+            'plugin-' . $slug . '-' . $version . '.json'
+        );
+        if ('notfound' === $status) {
+            report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $plugin_dir, 'plugin ' . $slug . ' ' . $version . ': not in the wordpress.org checksum archive (custom/premium plugin, or version not archived)');
+            $totals['NO_REFERENCE']++;
+            continue;
+        }
+        if ('ok' !== $status || empty($data['files']) || !is_array($data['files'])) {
+            report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $plugin_dir, 'plugin ' . $slug . ' ' . $version . ': could not fetch reference checksums');
+            $totals['NO_REFERENCE']++;
+            continue;
+        }
+
+        echo 'Checking plugin ' . $slug . ' ' . $version . ' (' . count($data['files']) . " files)\n";
+        $manifest = array();
+        foreach ($data['files'] as $relative_path => $sums) {
+            $manifest[$relative_path] = isset($sums['md5']) ? $sums['md5'] : null;
+        }
+        verify_against_manifest($plugin_dir, $manifest, 'plugin ' . $slug . ' ' . $version, list_files_recursive($plugin_dir, $plugin_dir), $totals);
+    }
+
+    // Single-file plugins (e.g. hello.php) sit directly in the plugins dir
+    // and carry no per-directory manifest.
+    foreach ((array) @glob($plugins_dir . '/*.php') as $loose_plugin) {
+        if ('index.php' === basename($loose_plugin)) {
+            continue;
+        }
+        report_finding('INFO', 'INTEGRITY_NO_REFERENCE', $loose_plugin, 'single-file plugin: no checksum manifest to verify against');
+        $totals['NO_REFERENCE']++;
+    }
+
+    echo 'Integrity scan complete: ' . $totals['MODIFIED'] . ' modified, ' . $totals['MISSING'] . ' missing, '
+        . $totals['EXTRA'] . ' extra, ' . $totals['NO_REFERENCE'] . " without reference checksums\n";
+}
+
 function pattern_matches($condition, $file_buffer)
 {
     // A condition is array('string' => needle) or array('regex' => pattern).
@@ -612,6 +894,11 @@ if ( isset($_GET['scancron']) ) {
 
 if ( isset($_GET['scanlog']) ) {
     scanLogTarget($_GET['scanlog']);
+    die();
+}
+
+if ( isset($_GET['scanintegrity']) ) {
+    scanIntegrity($_GET['scandirectory']);
     die();
 }
 

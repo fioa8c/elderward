@@ -21,6 +21,8 @@ php elderward.php scan_all=1               # scan every file, not just risky ext
 php elderward.php scancron=1               # check the current user's crontab for malware
 php elderward.php scanlog=/var/log/apache2/access.log   # scan one access log for IoCs
 php elderward.php scanlog=/var/log/apache2 # scan every access log in a directory (.gz included)
+php elderward.php scanintegrity=1 scandirectory=/path/to/wp-root   # verify core + plugins
+php elderward.php scanintegrity=1 checksumdir=/path/to/manifests   # ... without network access
 php elderward.php help=1                   # show usage
 ```
 
@@ -60,6 +62,18 @@ Delete the file from the server when you're done.
 - **Files** — signature-based detection and cleanup of known malware injections (e.g. the `ndsw`/`ndsx` and `wqpq` JavaScript campaigns), across common web extensions (`php`, `js`, `html`, ...). Cleaned files are written atomically (temp file + rename) so a failed write can never truncate the original.
 - **Crontab** — known persistence patterns (piped base64 decoders, pastebin downloads, tmp-dir droppers).
 - **Access logs** — known attack traffic: webshell requests, PHP files served from `wp-content/uploads`, wp-file-manager / Slider Revolution / TimThumb exploit attempts, `.env` probes, directory traversal, code and PHP-CGI injection, user enumeration, and xmlrpc/wp-login brute-force floods.
+- **Integrity** (`scanintegrity=1`) — verifies WordPress core and every plugin against the official wordpress.org checksums for the installed version. Reports `INTEGRITY_MODIFIED` (checksum mismatch), `INTEGRITY_MISSING` (file from the package gone), and `INTEGRITY_EXTRA` (file on disk that the package doesn't contain — extra PHP inside core or a plugin is the classic dropped webshell and reports as `HIGH`). Packages that can't be verified (custom/premium plugins, versions not in the archive) report as `INTEGRITY_NO_REFERENCE`, so a clean report never silently means "unchecked". Bundled themes/plugins under `wp-content` are skipped in the core pass (plugins are verified individually), `wp-config.php` is ignored, and themes are not covered yet — wordpress.org publishes no theme checksums.
+
+### Integrity checks without network access
+
+On hosts with no outbound network, pre-download the manifests elsewhere and pass `checksumdir=/path`:
+
+```
+core-{version}.json           from https://api.wordpress.org/core/checksums/1.0/?version={version}&locale={locale}
+plugin-{slug}-{version}.json  from https://downloads.wordpress.org/plugin-checksums/{slug}/{version}.json
+```
+
+TLS verification stays on for all API requests — this tool runs on already-compromised hosts, and an "all clean" answer must not be attacker-supplied.
 
 ## Adding signatures
 
