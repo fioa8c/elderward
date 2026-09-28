@@ -95,6 +95,20 @@ function write_cleaned_file($file_path, $cleaned_conent)
     return (true);
 }
 
+////////////////
+// Unified finding format, shared by every scanner:
+//
+//   SEVERITY,TYPE,path,detail
+//
+// The first three fields never contain commas; everything after the third
+// comma is free-form detail. Severities: HIGH, MEDIUM, LOW, INFO, ERROR.
+// Indented lines under a finding are supporting context (log examples etc).
+//////////////
+function report_finding($severity, $type, $path, $detail)
+{
+    echo $severity . ',' . $type . ',' . $path . ',' . $detail . "\n";
+}
+
 
 ////////////////
 // Cleanup signatures.
@@ -180,7 +194,7 @@ function scanCronTab()
                 foreach ($CRONTAB_SIGS as $item) {
                     foreach ($item as $name => $pattern) {
                         if (preg_match($pattern, $line)) {
-                            echo("$line $name\n");
+                            report_finding('HIGH', 'CRONTAB_IOC', 'crontab', $name . ': ' . $line);
                             break 2;
                         }
                     }
@@ -195,18 +209,22 @@ function scanCronTab()
 // Each signature matches one line of a common/combined format access log.
 // "threshold" hides findings until that many hits are seen: a single POST to
 // wp-login.php is normal traffic, five hundred of them is a brute force.
+// Findings report as MEDIUM (attack attempts) unless the signature sets
+// "severity" - traffic to a shell already on disk is HIGH.
 //////////////
 $ACCESS_LOG_SIGS = array(
     array(
         'name'        => 'access.uploads.php',
         'pattern'     => '@"(?:GET|POST|HEAD) /[^"\s]*wp-content/uploads/[^"\s]*\.ph(?:p[34578]?|tml|ps|t)\b@i',
         'threshold'   => 1,
+        'severity'    => 'HIGH',
         'description' => 'PHP file requested inside wp-content/uploads. Uploads should never contain executable PHP; this is usually a webshell dropped through an upload form.',
     ),
     array(
         'name'        => 'access.webshell.names',
         'pattern'     => '@"(?:GET|POST|HEAD) /[^"\s]*(?:wso\d*|filesman|alfa(?:-rex|_data)?|b374k|c99(?:shell)?|r57|indoxploit|mini_?shell|webshell|priv8)[^"\s]*\.ph@i',
         'threshold'   => 1,
+        'severity'    => 'HIGH',
         'description' => 'Request to a well-known webshell filename (WSO, FilesMan, AlfaShell, c99, r57, ...).',
     ),
     array(
@@ -362,8 +380,8 @@ function scanAccessLog($log_path)
         }
         $reported++;
 
-        echo "LOG_IOC," . $name . "," . $hit_counts[$name] . " hit(s)\n";
-        echo "    " . $signature['description'] . "\n";
+        $severity = isset($signature['severity']) ? $signature['severity'] : 'MEDIUM';
+        report_finding($severity, 'LOG_IOC', $log_path, $name . ': ' . $hit_counts[$name] . ' hit(s) - ' . $signature['description']);
         foreach ($hit_examples[$name] as $example) {
             echo "    e.g. " . $example . "\n";
         }
@@ -468,22 +486,22 @@ function apply_action($file_buffer, $file_path, $signature_name, $action)
         $cleared_file = preg_replace($action['remove_regex'], '', $file_buffer);
         if ( $cleared_file === null || ( strlen($file_buffer) === strlen($cleared_file) ) )
         {
-            echo 'Error cleaning ' . $file_path . ' with signature ' . $signature_name . ',' . $action['remove_regex'] . "\n";
+            report_finding('ERROR', 'CLEANUP_FAILED', $file_path, $signature_name . ': cleanup regex removed nothing: ' . $action['remove_regex']);
             return;
         }
         // Dry run: the cleanup regex was applied and verified to change
         // the file, but nothing is written or deleted.
         if ( isset($_GET['dryrun']) )
         {
-            echo "WOULD_CLEAR," . $file_path . "," . $signature_name . "\n";
+            report_finding('HIGH', 'MALWARE_FOUND', $file_path, $signature_name . ' (dry run: file not modified)');
             return;
         }
         if ( !write_cleaned_file($file_path, $cleared_file) )
         {
-            echo 'Error writing cleaned content to ' . $file_path . ' with signature ' . $signature_name . "\n";
+            report_finding('ERROR', 'CLEANUP_FAILED', $file_path, $signature_name . ': could not write cleaned file');
             return;
         }
-        echo "CLEARED," . $file_path . "," . $signature_name . "\n";
+        report_finding('HIGH', 'MALWARE_CLEANED', $file_path, $signature_name);
         return;
     }
 
@@ -491,19 +509,19 @@ function apply_action($file_buffer, $file_path, $signature_name, $action)
     {
         if ( isset($_GET['dryrun']) )
         {
-            echo "WOULD_CLEAR," . $file_path . "," . $signature_name . "\n";
+            report_finding('HIGH', 'MALWARE_FOUND', $file_path, $signature_name . ' (dry run: file not deleted)');
             return;
         }
         if ( false === unlink($file_path) )
         {
-            echo 'Error deleting ' . $file_path . ' with signature ' . $signature_name . "\n";
+            report_finding('ERROR', 'CLEANUP_FAILED', $file_path, $signature_name . ': could not delete file');
             return;
         }
-        echo "CLEARED," . $file_path . "," . $signature_name . "\n";
+        report_finding('HIGH', 'MALWARE_CLEANED', $file_path, $signature_name . ' (file deleted)');
         return;
     }
 
-    echo 'Error: unknown action for signature ' . $signature_name . "\n";
+    report_finding('ERROR', 'CLEANUP_FAILED', $file_path, 'unknown action for signature ' . $signature_name);
 }
 
 function cleanup_util($file_buffer, $file_path)

@@ -28,14 +28,22 @@ php elderward.php help=1                   # show usage
 
 ### Output
 
-File cleanup prints one line per action:
+Every scanner reports findings in one shared format, so results are easy to grep, sort, and paste into a ticket:
 
 ```
-CLEARED,/path/to/file.js,javascript_ndsw
-WOULD_CLEAR,/path/to/file.js,javascript_ndsw     (dry run)
+SEVERITY,TYPE,path,detail
 ```
 
-The log scanner prints a report per log file: each IoC found, how many times, example log lines, and the top source IPs behind the flagged requests. Noisy-by-nature signatures (e.g. `wp-login.php` POSTs) only fire above a volume threshold, so normal traffic doesn't raise alarms.
+The first three fields never contain commas; everything after the third comma is free-form detail. Severities are `HIGH`, `MEDIUM`, `LOW`, `INFO`, and `ERROR`. Indented lines under a finding are supporting context (example log lines, top source IPs). For example:
+
+```
+HIGH,MALWARE_CLEANED,/path/to/file.js,javascript_ndsw
+HIGH,MALWARE_FOUND,/path/to/file.js,javascript_ndsw (dry run: file not modified)
+HIGH,CRONTAB_IOC,crontab,crontab.tmp.006: * * * * * echo ... | base64 --decode > /tmp/x
+MEDIUM,LOG_IOC,/var/log/apache2/access.log,access.xmlrpc.flood: 4182 hit(s) - High volume of xmlrpc.php POSTs, ...
+```
+
+Log IoCs report as `MEDIUM` (attack attempts, including failed ones) except traffic to a shell already on disk, which is `HIGH`. Noisy-by-nature signatures (e.g. `wp-login.php` POSTs) only fire above a volume threshold, so normal traffic doesn't raise alarms.
 
 ### Running over HTTP (no shell access)
 
