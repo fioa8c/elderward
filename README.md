@@ -41,7 +41,7 @@ Every scanner reports findings in one shared format, so results are easy to grep
 SEVERITY,TYPE,path,detail
 ```
 
-The first three fields never contain commas; everything after the third comma is free-form detail. Severities are `HIGH`, `MEDIUM`, `LOW`, `INFO`, and `ERROR`. Indented lines under a finding are supporting context (example log lines, top source IPs). For example:
+The first three fields never contain commas; everything after the third comma is free-form detail. Because paths and log content come from a compromised host, `%`, control characters, and (in the path field) commas are percent-encoded, so a crafted filename can't shift fields or inject fake finding lines. Severities are `HIGH`, `MEDIUM`, `LOW`, `INFO`, and `ERROR`. Indented lines under a finding are supporting context (example log lines, top source IPs). For example:
 
 ```
 HIGH,MALWARE_CLEANED,/path/to/file.js,javascript_ndsw

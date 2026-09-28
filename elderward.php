@@ -128,10 +128,59 @@ function write_cleaned_file($file_path, $cleaned_conent)
 // The first three fields never contain commas; everything after the third
 // comma is free-form detail. Severities: HIGH, MEDIUM, LOW, INFO, ERROR.
 // Indented lines under a finding are supporting context (log examples etc).
+//
+// Paths and details come from a compromised host, so the attacker chooses
+// them: '%', control characters, and (in the path field) commas are
+// percent-encoded so a crafted filename cannot shift fields or inject
+// fake finding lines into the report.
 //////////////
+function sanitize_finding_field($text, $encode_commas)
+{
+    $text = str_replace('%', '%25', (string) $text);
+    if ($encode_commas) {
+        $text = str_replace(',', '%2C', $text);
+    }
+    return preg_replace_callback('/[\x00-\x1F\x7F]/', function ($match) {
+        return sprintf('%%%02X', ord($match[0]));
+    }, $text);
+}
+
 function report_finding($severity, $type, $path, $detail)
 {
-    echo $severity . ',' . $type . ',' . $path . ',' . $detail . "\n";
+    echo $severity . ',' . $type . ',' . sanitize_finding_field($path, true) . ',' . sanitize_finding_field($detail, false) . "\n";
+}
+
+function recursive_file_iterator($dir)
+{
+    // CATCH_GET_CHILD: an unreadable subdirectory is skipped instead of
+    // aborting the whole walk.
+    return new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY,
+        RecursiveIteratorIterator::CATCH_GET_CHILD
+    );
+}
+
+function is_scannable_file($file)
+{
+    global $extensions_to_check;
+
+    // Never scan (or correlate) this script itself.
+    if ($file->getRealPath() === __FILE__) {
+        return (false);
+    }
+    return isset($_GET['scan_all'])
+        || in_array(strtolower($file->getExtension()), $extensions_to_check, true);
+}
+
+function require_wordpress_root($root)
+{
+    $root = rtrim($root, '/');
+    if (!is_file($root . '/wp-includes/version.php')) {
+        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
+        exit(1);
+    }
+    return ($root);
 }
 
 
@@ -348,7 +397,45 @@ function merge_flagged_minutes(&$into, $from)
     }
 }
 
-function scanAccessLog($log_path)
+function read_log_line($fh, $is_gzipped)
+{
+    ///////////////
+    // Return one whole logical line so a signature can never be evaded by
+    // padding a request until the match straddles a read boundary. Lines
+    // beyond 64KB are scanned truncated and the remainder discarded, so an
+    // absurd line still cannot balloon memory.
+    //////////////
+    $max_line_length = 65536;
+    $line = '';
+    while (true) {
+        $chunk = $is_gzipped ? gzgets($fh, 8192) : fgets($fh, 8192);
+        if (false === $chunk) {
+            return ('' === $line) ? false : $line;
+        }
+        $line .= $chunk;
+        if ("\n" === substr($chunk, -1)) {
+            return ($line);
+        }
+        if (strlen($line) >= $max_line_length) {
+            // Discard the rest of this oversized line.
+            while (true) {
+                $chunk = $is_gzipped ? gzgets($fh, 8192) : fgets($fh, 8192);
+                if (false === $chunk || "\n" === substr($chunk, -1)) {
+                    return ($line);
+                }
+            }
+        }
+    }
+}
+
+function new_log_accumulator()
+{
+    // Hits accumulate ACROSS log files, so a brute force split over rotated
+    // logs still crosses its signature's reporting threshold.
+    return array('counts' => array(), 'examples' => array(), 'ips' => array(), 'minutes' => array());
+}
+
+function scanAccessLog($log_path, &$acc)
 {
     global $ACCESS_LOG_SIGS;
 
@@ -360,28 +447,26 @@ function scanAccessLog($log_path)
     $is_gzipped = ('gz' === strtolower(pathinfo($log_path, PATHINFO_EXTENSION)));
     if ($is_gzipped && !function_exists('gzopen')) {
         echo 'Error: zlib not available, skipping compressed log ' . $log_path . "\n";
-        return (array());
+        return;
     }
 
     $fh = $is_gzipped ? @gzopen($log_path, 'r') : @fopen($log_path, 'r');
     if (false === $fh) {
         echo 'Error reading ' . $log_path . "\n";
-        return (array());
+        return;
     }
 
     $max_examples = 5;
     $max_example_length = 300;
-    $hit_counts = array();
-    $hit_examples = array();
-    $hit_ips = array();
+    $hit_counts = &$acc['counts'];
+    $hit_examples = &$acc['examples'];
+    $hit_ips = &$acc['ips'];
     // Per-signature, per-minute buckets of matched lines, kept for the
     // correlate mode. Minute granularity bounds memory on flooded logs.
-    $hit_minutes = array();
+    $hit_minutes = &$acc['minutes'];
 
     while (true) {
-        // 8KB cap per read: an absurdly long line is scanned in chunks
-        // instead of ballooning memory.
-        $line = $is_gzipped ? gzgets($fh, 8192) : fgets($fh, 8192);
+        $line = read_log_line($fh, $is_gzipped);
         if (false === $line) {
             break;
         }
@@ -427,12 +512,22 @@ function scanAccessLog($log_path)
         }
     }
     $is_gzipped ? gzclose($fh) : fclose($fh);
+}
+
+function report_log_findings($acc, $target_label)
+{
+    global $ACCESS_LOG_SIGS;
+
+    $hit_counts = $acc['counts'];
+    $hit_examples = $acc['examples'];
+    $hit_ips = $acc['ips'];
+    $hit_minutes = $acc['minutes'];
 
     ///////////////
     // Report: every signature at or over its threshold, with example lines,
     // then the source IPs behind the reported hits.
     //////////////
-    echo "== Access log IoC report: " . $log_path . " ==\n";
+    echo "== Access log IoC report: " . $target_label . " ==\n";
 
     $reported = 0;
     $reported_ips = array();
@@ -448,9 +543,9 @@ function scanAccessLog($log_path)
         }
 
         $severity = isset($signature['severity']) ? $signature['severity'] : 'MEDIUM';
-        report_finding($severity, 'LOG_IOC', $log_path, $name . ': ' . $hit_counts[$name] . ' hit(s) - ' . $signature['description']);
+        report_finding($severity, 'LOG_IOC', $target_label, $name . ': ' . $hit_counts[$name] . ' hit(s) - ' . $signature['description']);
         foreach ($hit_examples[$name] as $example) {
-            echo "    e.g. " . $example . "\n";
+            echo "    e.g. " . sanitize_finding_field($example, false) . "\n";
         }
 
         foreach ($hit_ips[$name] as $ip => $count) {
@@ -474,8 +569,11 @@ function scanAccessLog($log_path)
 
 function scanLogTarget($target)
 {
+    $acc = new_log_accumulator();
+
     if (is_file($target)) {
-        return (scanAccessLog($target));
+        scanAccessLog($target, $acc);
+        return (report_log_findings($acc, $target));
     }
 
     if (!is_dir($target) || !is_readable($target)) {
@@ -485,14 +583,13 @@ function scanLogTarget($target)
 
     ///////////////
     // A directory target scans everything in it that looks like an access
-    // log (access*, *.log, rotated *.log.N and *.log.N.gz). Error logs have
-    // a different format and are skipped.
+    // log (access*, *.log, rotated *.log.N and *.log.N.gz) into ONE shared
+    // accumulator, so thresholds apply to the traffic as a whole rather
+    // than per rotation. Error logs have a different format: skipped.
     //////////////
-    $dir = new RecursiveDirectoryIterator($target, RecursiveDirectoryIterator::SKIP_DOTS);
-    $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+    $files = recursive_file_iterator($target);
 
     $logs_found = 0;
-    $flagged_minutes = array();
     foreach ($files as $file) {
         $basename = $file->getFilename();
         if (preg_match('@error@i', $basename)) {
@@ -501,20 +598,20 @@ function scanLogTarget($target)
         if (preg_match('@(?:access[^/]*|\.log(?:\.\d+)?(?:\.gz)?)$@i', $basename) !== 1) {
             continue;
         }
-        merge_flagged_minutes($flagged_minutes, scanAccessLog($file->getPathname()));
+        echo 'Scanning ' . $file->getPathname() . "\n";
+        scanAccessLog($file->getPathname(), $acc);
         $logs_found++;
     }
 
     if (0 === $logs_found) {
         echo 'No access log files found in ' . $target . "\n";
+        return (array());
     }
-    return ($flagged_minutes);
+    return (report_log_findings($acc, $target));
 }
 
 function correlate_files($root, $flagged_minutes, $window)
 {
-    global $extensions_to_check;
-
     ///////////////
     // The IR smoking gun: a file whose mtime falls inside the window around
     // flagged attack traffic. Report-only - a hit is a strong lead, but a
@@ -529,21 +626,17 @@ function correlate_files($root, $flagged_minutes, $window)
         exit(1);
     }
 
-    $dir = new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS);
-    $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+    $files = recursive_file_iterator($root);
 
     $correlated = 0;
     foreach ($files as $file) {
-        if ($file->getRealPath() === __FILE__) {
-            continue;
-        }
-        $scannable_file = isset($_GET['scan_all'])
-            || in_array(strtolower($file->getExtension()), $extensions_to_check, true);
-        if (!$scannable_file) {
+        if (!is_scannable_file($file)) {
             continue;
         }
 
-        $mtime = @$file->getMTime();
+        // filemtime, not SplFileInfo::getMTime - the latter throws (even
+        // through @) when the file vanishes between listing and stat.
+        $mtime = @filemtime($file->getPathname());
         if (false === $mtime) {
             continue;
         }
@@ -570,7 +663,7 @@ function correlate_files($root, $flagged_minutes, $window)
         report_finding($severity, 'LOG_FILE_CORRELATION', $path,
             'modified ' . date('Y-m-d H:i:s', $mtime) . ' within ' . $window . 's of flagged traffic: '
             . implode(' ', array_keys($in_window['names'])) . ' (' . $in_window['count'] . ' flagged requests in window)');
-        echo '    e.g. ' . $in_window['example'] . "\n";
+        echo '    e.g. ' . sanitize_finding_field($in_window['example'], false) . "\n";
         $correlated++;
     }
 
@@ -612,17 +705,23 @@ function http_get($url)
         'ignore_errors' => true,
     )));
     $body = @file_get_contents($url, false, $context);
+    $status = isset($http_response_header) ? status_from_response_headers($http_response_header) : 0;
+    return array($status, (false === $body) ? '' : $body);
+}
+
+function status_from_response_headers($headers)
+{
+    // With redirects the array holds several header blocks; the last
+    // status line is the one for the final response.
     $status = 0;
-    if (isset($http_response_header) && is_array($http_response_header)) {
-        // With redirects the array holds several header blocks; the last
-        // status line is the one for the final response.
-        foreach ($http_response_header as $header_line) {
+    if (is_array($headers)) {
+        foreach ($headers as $header_line) {
             if (preg_match('@^HTTP/\S+\s(\d{3})@', $header_line, $matches)) {
                 $status = (int) $matches[1];
             }
         }
     }
-    return array($status, (false === $body) ? '' : $body);
+    return ($status);
 }
 
 function fetch_reference_checksums($url, $offline_name)
@@ -663,16 +762,12 @@ function is_php_file($path)
     return (preg_match('@\.(?:ph(?:p[34578]?|t|tml|ps)|inc)$@i', $path) === 1);
 }
 
-function file_checksum_matches($file_path, $expected)
+function md5_in_list($actual_md5, $expected)
 {
-    $actual = @md5_file($file_path);
-    if (false === $actual) {
-        return (false);
-    }
     // The plugin checksum API returns a string, or an array of valid
     // checksums when a release was ever repackaged.
     foreach ((array) $expected as $candidate) {
-        if (hash_equals(strtolower((string) $candidate), $actual)) {
+        if (null !== $candidate && hash_equals(strtolower((string) $candidate), $actual_md5)) {
             return (true);
         }
     }
@@ -682,11 +777,7 @@ function file_checksum_matches($file_path, $expected)
 function list_files_recursive($dir, $base)
 {
     $relative_paths = array();
-    $walker = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::LEAVES_ONLY,
-        RecursiveIteratorIterator::CATCH_GET_CHILD
-    );
+    $walker = recursive_file_iterator($dir);
     $base_length = strlen(rtrim($base, '/')) + 1;
     foreach ($walker as $file) {
         if (!$file->isFile()) {
@@ -726,7 +817,18 @@ function verify_against_manifest($base_dir, $manifest, $label, $present_files, &
             $restorable[] = array('rel' => $relative_path, 'expected' => $expected);
             continue;
         }
-        if (null === $expected || !file_checksum_matches($full_path, $expected)) {
+
+        // A file we cannot read is UNVERIFIED, not modified: saying
+        // "checksum does not match" would be false, and restoring would
+        // overwrite content the tool never saw.
+        $actual_md5 = @md5_file($full_path);
+        if (false === $actual_md5) {
+            report_finding('ERROR', 'INTEGRITY_UNREADABLE', $full_path, $label . ': cannot read the file to verify its checksum');
+            $totals['UNREADABLE']++;
+            continue;
+        }
+
+        if (null === $expected || !md5_in_list($actual_md5, $expected)) {
             $severity = is_php_file($relative_path) ? 'HIGH' : 'MEDIUM';
             report_finding($severity, 'INTEGRITY_MODIFIED', $full_path, $label . ': checksum does not match the official package');
             $totals['MODIFIED']++;
@@ -793,11 +895,26 @@ function http_get_file($url, $dest)
         return ((false !== $ok) ? $status : 0);
     }
 
-    list($status, $body) = http_get($url);
-    if (200 !== $status) {
-        return ($status);
+    // No curl: stream through fopen so the zip never sits in memory.
+    $context = stream_context_create(array('http' => array(
+        'timeout'       => 300,
+        'user_agent'    => 'elderward',
+        'ignore_errors' => true,
+    )));
+    $src = @fopen($url, 'r', false, $context);
+    if (false === $src) {
+        return (0);
     }
-    return ((strlen($body) === @file_put_contents($dest, $body)) ? 200 : 0);
+    $status = isset($http_response_header) ? status_from_response_headers($http_response_header) : 0;
+    $dst = @fopen($dest, 'w');
+    if (false === $dst) {
+        fclose($src);
+        return (0);
+    }
+    $copied = @stream_copy_to_stream($src, $dst);
+    fclose($src);
+    fclose($dst);
+    return ((false === $copied) ? 0 : $status);
 }
 
 function acquire_package_zip($zip_url, $offline_zip_name)
@@ -915,14 +1032,7 @@ function restore_items_from_zip($zip_path, $zip_prefix, $base_dir, $items, $labe
         // match the reference manifest, so a tampered zip (or a manifest/zip
         // version mix-up) can never plant content.
         //////////////
-        $content_matches = false;
-        $content_md5 = md5($content);
-        foreach ((array) $item['expected'] as $candidate) {
-            if (null !== $candidate && hash_equals(strtolower((string) $candidate), $content_md5)) {
-                $content_matches = true;
-            }
-        }
-        if (!$content_matches) {
+        if (!md5_in_list(md5($content), $item['expected'])) {
             report_finding('ERROR', 'RESTORE_FAILED', $target, $label . ': packaged file does not match the reference checksum, refusing to restore');
             continue;
         }
@@ -982,14 +1092,10 @@ function read_plugin_version($plugin_dir)
 
 function scanIntegrity($root)
 {
-    $root = rtrim($root, '/');
+    $root = require_wordpress_root($root);
     $version_file = $root . '/wp-includes/version.php';
-    if (!is_file($version_file)) {
-        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
-        exit(1);
-    }
 
-    $totals = array('MODIFIED' => 0, 'MISSING' => 0, 'EXTRA' => 0, 'NO_REFERENCE' => 0);
+    $totals = array('MODIFIED' => 0, 'MISSING' => 0, 'EXTRA' => 0, 'NO_REFERENCE' => 0, 'UNREADABLE' => 0);
 
     if (isset($_GET['quarantinedir'])) {
         $quarantine_real = @realpath($_GET['quarantinedir']);
@@ -1164,7 +1270,8 @@ function scanIntegrity($root)
     }
 
     echo 'Integrity scan complete: ' . $totals['MODIFIED'] . ' modified, ' . $totals['MISSING'] . ' missing, '
-        . $totals['EXTRA'] . ' extra, ' . $totals['NO_REFERENCE'] . " without reference checksums\n";
+        . $totals['EXTRA'] . ' extra, ' . $totals['UNREADABLE'] . ' unreadable, '
+        . $totals['NO_REFERENCE'] . " without reference checksums\n";
 }
 
 ////////////////
@@ -1210,15 +1317,10 @@ function check_prepend_directives($root, $config_path, &$counts)
 
 function scanQuick($root)
 {
-    $root = rtrim($root, '/');
-    if (!is_file($root . '/wp-includes/version.php')) {
-        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
-        exit(1);
-    }
+    $root = require_wordpress_root($root);
 
     $counts = array('UPLOADS_PHP' => 0, 'PHP_PREPEND' => 0, 'MU_PLUGIN' => 0, 'HIDDEN_PHP' => 0);
-    $dir = new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS);
-    $files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+    $files = recursive_file_iterator($root);
 
     foreach ($files as $file) {
         if (!$file->isFile()) {
@@ -1386,11 +1488,7 @@ function analyze_time_group($group_label, $file_paths, &$totals)
 
 function scanTimestamps($root)
 {
-    $root = rtrim($root, '/');
-    if (!is_file($root . '/wp-includes/version.php')) {
-        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
-        exit(1);
-    }
+    $root = require_wordpress_root($root);
 
     $totals = array('OUTLIER' => 0, 'TIMESTOMP' => 0);
 
@@ -1628,9 +1726,21 @@ $extensions_to_check = array(
 lint_signatures();
 
 ////////////
-// Standalone scan modes: neither needs a scan directory, so they run and
-// exit before the directory validation below.
+// Standalone scan modes: each runs alone and exits before the directory
+// validation below. Combining them would silently run only the first, so
+// asking for more than one is an error instead.
 ///////////
+$requested_modes = array();
+foreach (array('scancron', 'scanlog', 'scanintegrity', 'scantimes', 'quickscan') as $mode) {
+    if (isset($_GET[$mode])) {
+        $requested_modes[] = $mode;
+    }
+}
+if (count($requested_modes) > 1) {
+    echo 'Error: scan modes are mutually exclusive, run them one at a time: ' . implode(', ', $requested_modes) . "\n";
+    exit(1);
+}
+
 if ( isset($_GET['correlate']) && !isset($_GET['scanlog']) ) {
     echo "Error: correlate=1 needs scanlog=/path to know which traffic to correlate against\n";
     exit(1);
@@ -1674,9 +1784,7 @@ if (!is_dir($_GET['scandirectory']) || !is_readable($_GET['scandirectory'])) {
     exit(1);
 }
 
-$dir = new RecursiveDirectoryIterator($_GET['scandirectory'], RecursiveDirectoryIterator::SKIP_DOTS);
-// CATCH_GET_CHILD: an unreadable subdirectory is skipped instead of aborting the whole walk.
-$files = new RecursiveIteratorIterator($dir, RecursiveIteratorIterator::LEAVES_ONLY, RecursiveIteratorIterator::CATCH_GET_CHILD);
+$files = recursive_file_iterator($_GET['scandirectory']);
 
 ///////////
 // iterating through the files collected
@@ -1685,17 +1793,10 @@ foreach( $files as $file ){
     $target_file = $file->getPathname();
 
 //////////
-//// Ignore current script
+//// Skip this script itself and anything outside the risky-extension list
+//// (scan_all=1 overrides) - shared with the correlate walk.
 /////////
-    if ( $file->getRealPath() === __FILE__ ) {
-         continue;
-    }
-//////////
-//// File will be scannable if extensions are on the list $extensions_to_check
-/////////
-    $scannable_file = isset($_GET['scan_all'])
-        || in_array(strtolower($file->getExtension()), $extensions_to_check, true);
-    if ( !$scannable_file ) {
+    if ( !is_scannable_file($file) ) {
         continue;
     }
 ///////////
