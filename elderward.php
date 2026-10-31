@@ -242,6 +242,22 @@ function scan_exit()
     exit($FINDINGS_EXIT_CODE);
 }
 
+function fatal_error($message)
+{
+    // Usage/fatal errors exit 1. In JSON mode stdout must stay
+    // machine-readable, so the error goes out as an event (and to STDERR
+    // for humans watching the terminal) instead of as loose text.
+    if (json_output()) {
+        echo json_encode(array('event' => 'error', 'detail' => $message)) . "\n";
+        if (defined('STDERR')) {
+            fwrite(STDERR, 'Error: ' . $message . "\n");
+        }
+    } else {
+        echo 'Error: ' . $message . "\n";
+    }
+    exit(1);
+}
+
 function recursive_file_iterator($dir)
 {
     // CATCH_GET_CHILD: an unreadable subdirectory is skipped instead of
@@ -269,8 +285,7 @@ function require_wordpress_root($root)
 {
     $root = rtrim($root, '/');
     if (!is_file($root . '/wp-includes/version.php')) {
-        echo 'Error: ' . $root . " does not look like a WordPress root (wp-includes/version.php not found)\n";
-        exit(1);
+        fatal_error($root . ' does not look like a WordPress root (wp-includes/version.php not found)');
     }
     return ($root);
 }
@@ -672,8 +687,7 @@ function scanLogTarget($target)
     }
 
     if (!is_dir($target) || !is_readable($target)) {
-        echo 'Error: cannot open log target ' . $target . "\n";
-        exit(1);
+        fatal_error('cannot open log target ' . $target);
     }
 
     ///////////////
@@ -717,8 +731,7 @@ function correlate_files($root, $flagged_minutes, $window)
         return;
     }
     if (!is_dir($root) || !is_readable($root)) {
-        echo 'Error: cannot open correlation directory ' . $root . "\n";
-        exit(1);
+        fatal_error('cannot open correlation directory ' . $root);
     }
 
     $files = recursive_file_iterator($root);
@@ -1431,7 +1444,7 @@ $DB_OPTION_SIGS = array(
 $DB_POST_SIGS = array(
     array(
         'name'        => 'db.post.php-tag',
-        'pattern'     => '@<\?php@',
+        'pattern'     => '@<\?php@i',
         'severity'    => 'HIGH',
         'description' => 'PHP tag inside post content - WordPress never stores executable PHP in posts',
     ),
@@ -1467,15 +1480,25 @@ function parse_wp_config($root)
         return (null);
     }
 
-    $content = @file_get_contents($config_path);
+    // Hostile host: never slurp an unbounded file. A real config is a few KB.
+    $content = @file_get_contents($config_path, false, null, 0, 65536);
     if (false === $content) {
         return (null);
     }
+    // Drop comment lines first: a commented-out define() left behind by a
+    // migration must not shadow the live one below it.
+    $content = preg_replace('@^[ \t]*(?://|#|/?\*).*$@m', '', $content);
 
     $config = array('path' => $config_path, 'prefix' => 'wp_');
     foreach (array('DB_NAME', 'DB_USER', 'DB_PASSWORD', 'DB_HOST') as $constant) {
-        if (preg_match('/define\s*\(\s*[\'"]' . $constant . '[\'"]\s*,\s*([\'"])(.*?)\1\s*\)/', $content, $matches)) {
-            $config[$constant] = $matches[2];
+        // The value is a single- or double-quoted PHP string literal; escaped
+        // quotes inside it must not end the match.
+        if (preg_match('/define\s*\(\s*[\'"]' . $constant . '[\'"]\s*,\s*(?:\'((?:[^\'\\\\]|\\\\.)*)\'|"((?:[^"\\\\]|\\\\.)*)")\s*\)/', $content, $matches)) {
+            if (isset($matches[2])) {
+                $config[$constant] = decode_php_string_literal('"', $matches[2]);
+            } else {
+                $config[$constant] = decode_php_string_literal("'", $matches[1]);
+            }
         }
     }
     if (preg_match('/\$table_prefix\s*=\s*[\'"]([A-Za-z0-9_]+)[\'"]/', $content, $matches)) {
@@ -1493,23 +1516,48 @@ function parse_wp_config($root)
     return ($config);
 }
 
+function decode_php_string_literal($quote, $raw)
+{
+    // Single-quoted PHP strings only escape \\ and \'; double-quoted ones
+    // take the C-style set. Variable interpolation cannot be resolved
+    // without executing the file, so that (rare) config fails to connect.
+    if ("'" === $quote) {
+        return preg_replace('/\\\\([\'\\\\])/', '$1', $raw);
+    }
+    return stripcslashes(str_replace('\\$', '$', $raw));
+}
+
 function db_connect($config)
 {
     // PHP 8.1+ throws mysqli exceptions by default; this engine handles
     // errors fail-closed on return values instead.
     mysqli_report(MYSQLI_REPORT_OFF);
 
-    // DB_HOST can be "host", "host:port", or "host:/path/to/socket".
+    ///////////////
+    // DB_HOST can be "host", "host:port", "host:/path/to/socket", or an
+    // IPv6 literal "[::1]" / "[::1]:3306" - the same forms wpdb accepts.
+    //////////////
     $host = $config['DB_HOST'];
     $port = null;
     $socket = null;
-    if (false !== strpos($host, ':')) {
-        list($host, $port_or_socket) = explode(':', $host, 2);
-        if (0 === strpos($port_or_socket, '/')) {
-            $socket = $port_or_socket;
-        } else {
-            $port = (int) $port_or_socket;
+    $socket_pos = strpos($host, ':/');
+    if (false !== $socket_pos) {
+        $socket = substr($host, $socket_pos + 1);
+        $host = substr($host, 0, $socket_pos);
+    }
+    if (substr_count($host, ':') > 1) {
+        if (preg_match('/^\[?([0-9a-fA-F:]+)\]?(?::(\d+))?$/', $host, $matches)) {
+            $host = $matches[1];
+            if (isset($matches[2])) {
+                $port = (int) $matches[2];
+            }
         }
+    } elseif (false !== strpos($host, ':')) {
+        list($host, $port) = explode(':', $host, 2);
+        $port = (int) $port;
+    }
+    if (0 === $port) {
+        $port = null;
     }
 
     $db = @mysqli_connect($host, $config['DB_USER'], $config['DB_PASSWORD'], $config['DB_NAME'], $port, $socket);
@@ -1520,15 +1568,40 @@ function db_connect($config)
     return ($db);
 }
 
+function db_report_failure($prefix, $table, $what, $error)
+{
+    ///////////////
+    // A query that fails or a result stream that dies mid-way means that
+    // part of the database was NOT checked. That is an ERROR finding (exit
+    // 2, visible in JSON) - never a progress line and a clean-looking
+    // summary.
+    //////////////
+    report_finding('ERROR', 'DB_QUERY_FAILED', 'db:' . $prefix . $table, $what . ' NOT verified: ' . $error);
+}
+
+function db_stream_completed($db, $prefix, $table, $what)
+{
+    // mysqli_fetch_* returns null both at the end of a result and when the
+    // connection drops; only errno tells them apart.
+    if (0 !== mysqli_errno($db)) {
+        db_report_failure($prefix, $table, $what . ' (result stream ended early)', mysqli_error($db));
+        return (false);
+    }
+    return (true);
+}
+
 function scan_db_admins($db, $prefix, &$counts)
 {
+    // Serialized capabilities look like a:1:{s:13:"administrator";b:1;}.
+    // Matching the b:1 excludes a revoked role (b:0) and look-alike custom
+    // role names.
     $sql = 'SELECT u.ID, u.user_login, u.user_email, u.user_registered'
         . ' FROM ' . $prefix . 'users u'
         . ' JOIN ' . $prefix . 'usermeta m ON m.user_id = u.ID'
-        . " WHERE m.meta_key = '" . $prefix . "capabilities' AND m.meta_value LIKE '%administrator%'";
+        . " WHERE m.meta_key = '" . $prefix . "capabilities' AND m.meta_value LIKE '%\"administrator\";b:1;%'";
     $result = @mysqli_query($db, $sql);
     if (false === $result) {
-        progress('Error querying users: ' . mysqli_error($db) . "\n");
+        db_report_failure($prefix, 'users', 'administrators', mysqli_error($db));
         return;
     }
 
@@ -1546,6 +1619,37 @@ function scan_db_admins($db, $prefix, &$counts)
         }
     }
     mysqli_free_result($result);
+    db_stream_completed($db, $prefix, 'users', 'administrators');
+}
+
+// Capabilities that amount to site takeover. A role other than
+// administrator holding one of them is how an attacker keeps a
+// low-profile account powerful. unfiltered_html is left out: editors hold
+// it by default on single-site installs.
+define('DB_ADMIN_CAPS', 'manage_options|edit_users|create_users|promote_users|delete_users|edit_files|edit_plugins|edit_themes|install_plugins|install_themes|update_core|activate_plugins|switch_themes');
+
+function check_user_roles($value, $where, &$counts)
+{
+    ///////////////
+    // {prefix}user_roles is serialized role => array(name, capabilities =>
+    // array(cap => bool)). Parsed with a regex, never unserialize()d: each
+    // capabilities array holds no nested arrays, so the lazy match stops at
+    // the first "}}" (capabilities close + role close).
+    //////////////
+    if (!preg_match_all('/s:\d+:"([^"]*)";a:\d+:\{s:4:"name";s:\d+:"[^"]*";s:12:"capabilities";a:\d+:\{(.*?)\}\}/s', $value, $roles, PREG_SET_ORDER)) {
+        return;
+    }
+    foreach ($roles as $role) {
+        if ('administrator' === $role[1]) {
+            continue;
+        }
+        if (preg_match_all('/"(' . DB_ADMIN_CAPS . ')";b:1;/', $role[2], $caps)) {
+            report_finding('MEDIUM', 'DB_ROLE_CAPS', $where,
+                'role "' . $role[1] . '" holds administrator-level capabilities: ' . implode(', ', array_unique($caps[1]))
+                . ' - role-editor plugins and shop-manager roles do this legitimately; verify it was intentional and check who holds the role');
+            $counts['FLAGGED_OPTIONS']++;
+        }
+    }
 }
 
 function scan_db_options($db, $prefix, $root, &$counts)
@@ -1556,7 +1660,7 @@ function scan_db_options($db, $prefix, $root, &$counts)
     $sql = 'SELECT option_name, SUBSTRING(option_value, 1, ' . DB_VALUE_SCAN_CAP . ') FROM ' . $prefix . 'options';
     $result = @mysqli_query($db, $sql, MYSQLI_USE_RESULT);
     if (false === $result) {
-        progress('Error querying options: ' . mysqli_error($db) . "\n");
+        db_report_failure($prefix, 'options', 'options', mysqli_error($db));
         return;
     }
 
@@ -1598,18 +1702,27 @@ function scan_db_options($db, $prefix, $root, &$counts)
             continue;
         }
 
+        // Role definitions: a non-admin role quietly granted admin powers.
+        if ($prefix . 'user_roles' === $option_name) {
+            check_user_roles($value, $where, $counts);
+            continue;
+        }
+
         foreach ($DB_OPTION_SIGS as $signature) {
-            if (preg_match($signature['pattern'], $value) !== 1) {
+            if (preg_match($signature['pattern'], $value, $hit, PREG_OFFSET_CAPTURE) !== 1) {
                 continue;
             }
+            // Excerpt around the match itself, not the start of the value.
+            $excerpt_start = max(0, $hit[0][1] - 40);
             report_finding($signature['severity'], 'DB_OPTION_IOC', $where,
                 $signature['name'] . ': ' . $signature['description'],
-                array('e.g. ' . substr($value, max(0, strpos($value, '<') === false ? 0 : strpos($value, '<')), 200)));
+                array('e.g. ' . substr($value, $excerpt_start, 200)));
             $counts['FLAGGED_OPTIONS']++;
             break;
         }
     }
     mysqli_free_result($result);
+    db_stream_completed($db, $prefix, 'options', 'options');
 }
 
 function scan_db_posts($db, $prefix, &$counts)
@@ -1621,14 +1734,17 @@ function scan_db_posts($db, $prefix, &$counts)
     // only candidates come back (streamed, value capped) for the real
     // pattern check.
     //////////////
+    // Revisions and autosaves (post_type revision) would repeat every
+    // injected post once per saved version: one finding per live post.
     $sql = 'SELECT ID, post_title, post_type, SUBSTRING(post_content, 1, ' . DB_VALUE_SCAN_CAP . ')'
         . ' FROM ' . $prefix . 'posts'
-        . " WHERE post_content LIKE '%<?php%' OR post_content LIKE '%eval(%'"
+        . " WHERE post_type <> 'revision'"
+        . " AND (post_content LIKE '%<?php%' OR post_content LIKE '%eval(%'"
         . " OR post_content LIKE '%fromCharCode%' OR post_content LIKE '%atob(%'"
-        . " OR post_content LIKE '%unescape(%' OR post_content LIKE '%<iframe%'";
+        . " OR post_content LIKE '%unescape(%' OR post_content LIKE '%<iframe%')";
     $result = @mysqli_query($db, $sql, MYSQLI_USE_RESULT);
     if (false === $result) {
-        progress('Error querying posts: ' . mysqli_error($db) . "\n");
+        db_report_failure($prefix, 'posts', 'posts', mysqli_error($db));
         return;
     }
 
@@ -1651,6 +1767,7 @@ function scan_db_posts($db, $prefix, &$counts)
         }
     }
     mysqli_free_result($result);
+    db_stream_completed($db, $prefix, 'posts', 'posts');
 
     if ($suppressed > 0) {
         progress('...and ' . $suppressed . " more flagged posts not listed\n");
@@ -1684,10 +1801,15 @@ function scanDatabase($root, $fatal_on_error)
 
     if (null !== $failure) {
         if ($fatal_on_error) {
-            echo 'Error: ' . $failure . "\n";
-            exit(1);
+            fatal_error($failure);
         }
-        progress('Skipping database scan: ' . $failure . "\n");
+        ///////////////
+        // Inside scanall a skipped database is an ERROR finding: it has to
+        // show in the JSON stream and the exit code, or "nothing found"
+        // silently means "never looked".
+        //////////////
+        $where = (null !== $config) ? $config['path'] : $root . '/wp-config.php';
+        report_finding('ERROR', 'DB_UNAVAILABLE', $where, $failure . ' - the database was NOT scanned');
         return;
     }
 
@@ -2060,8 +2182,7 @@ function lint_signatures()
     {
         if ( !isset($signature['prefilter'], $signature['triggers'], $signature['action']) )
         {
-            echo 'Invalid cleanup signature ' . $name . ": prefilter, triggers and action are required\n";
-            exit(1);
+            fatal_error('invalid cleanup signature ' . $name . ': prefilter, triggers and action are required');
         }
 
         $conditions = array_merge(array($signature['prefilter'], $signature['action']), $signature['triggers']);
@@ -2078,8 +2199,7 @@ function lint_signatures()
             }
             if ( null !== $pattern && false === @preg_match($pattern, '') )
             {
-                echo 'Invalid regex in cleanup signature ' . $name . ': ' . $pattern . "\n";
-                exit(1);
+                fatal_error('invalid regex in cleanup signature ' . $name . ': ' . $pattern);
             }
         }
     }
@@ -2090,8 +2210,7 @@ function lint_signatures()
         {
             if ( false === @preg_match($pattern, '') )
             {
-                echo 'Invalid regex in crontab signature ' . $name . ': ' . $pattern . "\n";
-                exit(1);
+                fatal_error('invalid regex in crontab signature ' . $name . ': ' . $pattern);
             }
         }
     }
@@ -2100,8 +2219,7 @@ function lint_signatures()
     {
         if ( false === @preg_match($signature['pattern'], '') )
         {
-            echo 'Invalid regex in access log signature ' . $signature['name'] . ': ' . $signature['pattern'] . "\n";
-            exit(1);
+            fatal_error('invalid regex in access log signature ' . $signature['name'] . ': ' . $signature['pattern']);
         }
     }
 
@@ -2109,8 +2227,7 @@ function lint_signatures()
     {
         if ( false === @preg_match($signature['pattern'], '') )
         {
-            echo 'Invalid regex in database signature ' . $signature['name'] . ': ' . $signature['pattern'] . "\n";
-            exit(1);
+            fatal_error('invalid regex in database signature ' . $signature['name'] . ': ' . $signature['pattern']);
         }
     }
 }
@@ -2175,13 +2292,11 @@ foreach (array('scanall', 'scancron', 'scanlog', 'scanintegrity', 'scantimes', '
 // scanall consumes scanlog as its log input; every other combination would
 // silently run only one mode, so it is an error instead.
 if (count($requested_modes) > 1 && $requested_modes !== array('scanall', 'scanlog')) {
-    echo 'Error: scan modes are mutually exclusive, run them one at a time: ' . implode(', ', $requested_modes) . "\n";
-    exit(1);
+    fatal_error('scan modes are mutually exclusive, run them one at a time: ' . implode(', ', $requested_modes));
 }
 
 if ( isset($_GET['correlate']) && !isset($_GET['scanlog']) ) {
-    echo "Error: correlate=1 needs scanlog=/path to know which traffic to correlate against\n";
-    exit(1);
+    fatal_error('correlate=1 needs scanlog=/path to know which traffic to correlate against');
 }
 
 if ( isset($_GET['scanall']) ) {
@@ -2233,8 +2348,7 @@ function run_signature_scan($scan_dir)
     global $filesize_limit;
 
     if (!is_dir($scan_dir) || !is_readable($scan_dir)) {
-        echo 'Error: cannot open scan directory ' . $scan_dir . "\n";
-        exit(1);
+        fatal_error('cannot open scan directory ' . $scan_dir);
     }
 
     $files = recursive_file_iterator($scan_dir);

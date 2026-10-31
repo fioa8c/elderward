@@ -174,9 +174,16 @@ UPDATE wp_options SET option_value='http://evil.example/' WHERE option_name='sit
 -- INSERT a user + wp_usermeta row with meta_key wp_capabilities LIKE '%administrator%'
 ```
 
-Expect: `HIGH,DB_OPTION_IOC` for `ew_test`, `HIGH,DB_SITE_URL` for the non-URL... (`http://evil.example/` is a valid URL so it reports INFO — the point is it should now differ from your real address, which the operator eyeballs), and `MEDIUM,DB_NEW_ADMIN` for the new admin. Remember to restore `siteurl` afterward or the site breaks.
+Expect: `HIGH,DB_OPTION_IOC` for `ew_test` with the `e.g.` excerpt showing the `eval(atob(` itself, `HIGH,DB_SITE_URL` for the non-URL... (`http://evil.example/` is a valid URL so it reports INFO — the point is it should now differ from your real address, which the operator eyeballs), and `MEDIUM,DB_NEW_ADMIN` for the new admin. Remember to restore `siteurl` afterward or the site breaks.
 
-**E3. Non-standard setups.** If your site uses a custom `$table_prefix`, external DB host, or has `wp-config.php` one level above the web root, confirm E1 still connects. **PASTE any connection error** — DB_HOST parsing (socket vs port) is the most likely real-world snag.
+Role tampering: with a role-editor plugin (or by editing `wp_user_roles` directly) grant `manage_options` to the Subscriber role. Expect `MEDIUM,DB_ROLE_CAPS,db:wp_options:wp_user_roles,role "subscriber" holds administrator-level capabilities: manage_options ...`. The Editor role's default `unfiltered_html` must NOT flag. Save a few revisions of a post containing `<?php` — expect exactly one `DB_POST_IOC` for the live post, none for the revisions.
+
+**E3. Non-standard setups.** If your site uses a custom `$table_prefix`, external DB host, or has `wp-config.php` one level above the web root, confirm E1 still connects. **PASTE any connection error** — DB_HOST parsing (socket vs port vs IPv6) is the most likely real-world snag. A commented-out `// define('DB_HOST', ...)` left above the live one must be ignored.
+
+**E4. Failures are loud, not silent.** Temporarily set a wrong `DB_PASSWORD` (or `$table_prefix`) in a *copy* of wp-config.php and point `scandirectory` at that copy's root:
+
+- `$EW scandb=1 scandirectory=$COPY` → `Error: could not connect ...`, exit 1; with `format=json` the only stdout line is `{"event":"error",...}`.
+- `$EW scanall=1 scandirectory=$COPY` → the sorted report contains `ERROR,DB_UNAVAILABLE,...wp-config.php,... the database was NOT scanned` and exit is at least 2. With a wrong prefix instead: three `ERROR,DB_QUERY_FAILED` lines (users, options, posts).
 
 ---
 
