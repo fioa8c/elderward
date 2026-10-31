@@ -1,0 +1,24 @@
+{
+    "name": "fioa8c/elderward",
+    "description": "Malware scanner and incident-response toolkit for WordPress (development dependencies only; the plugin itself has none).",
+    "type": "wordpress-plugin",
+    "license": "GPL-2.0-or-later",
+    "require": {
+        "php": ">=7.2"
+    },
+    "require-dev": {
+        "wp-coding-standards/wpcs": "^3.0",
+        "phpcompatibility/phpcompatibility-wp": "^2.1",
+        "dealerdirect/phpcodesniffer-composer-installer": "^1.0"
+    },
+    "config": {
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true
+        }
+    },
+    "scripts": {
+        "lint": "for f in $(git ls-files '*.php'); do php -l \"$f\" > /dev/null || exit 1; done",
+        "phpcs": "phpcs --standard=phpcs.xml.dist",
+        "regress": "bash tests/regress.sh"
+    }
+}

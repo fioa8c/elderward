@@ -1,0 +1,12 @@
+.distignore
+.git
+.gitignore
+.github
+CLAUDE.md
+TESTPLAN.md
+composer.json
+composer.lock
+phpcs.xml.dist
+tests
+vendor
+node_modules
