@@ -10,3 +10,5 @@ phpcs.xml.dist
 tests
 vendor
 node_modules
+build
+.wordpress-org

@@ -1,4 +1,10 @@
-# Elderward
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/img/elderward-logo.svg">
+    <img src="assets/img/elderward-logo-on-light.svg" alt="Elderward" width="400">
+  </picture>
+</p>
+
 
 Elderward is a free malware scanner and incident-response toolkit for WordPress sites. It checks files for signs of compromise and can remove known malware, verifies core, plugins and themes against the official wordpress.org packages, scans the database for rogue administrators and injected content, and reads access logs for known indicators of compromise (IoCs) so you can understand how the attack happened — not just clean up after it.
 

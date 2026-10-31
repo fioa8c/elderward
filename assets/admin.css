@@ -1,3 +1,66 @@
+/* Brand header: the website's palette (abyss, bone, sigil gold, verdigris). */
+.elderward-wrap .elderward-brand {
+	display: flex;
+	align-items: center;
+	gap: 18px;
+	margin: 20px 0 0;
+	padding: 18px 22px;
+	max-width: 900px;
+	box-sizing: border-box;
+	color: #dcd3b0;
+	background:
+		radial-gradient(ellipse 60% 120% at 85% 50%, rgba(23, 61, 55, 0.8), transparent 70%),
+		radial-gradient(ellipse 70% 100% at 5% 100%, rgba(14, 43, 39, 0.9), transparent 70%),
+		#061614;
+	border: 1px solid #173d37;
+	border-radius: 2px;
+}
+
+.elderward-brand-mark {
+	flex: 0 0 auto;
+	width: 64px;
+	height: 64px;
+	filter: drop-shadow(0 0 10px rgba(217, 174, 85, 0.25));
+}
+
+.elderward-brand-text {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.elderward-brand-word {
+	display: block;
+	width: auto;
+	height: 34px;
+}
+
+.elderward-brand-tag {
+	margin: 8px 0 0;
+	font-family: Menlo, Consolas, monaco, monospace;
+	font-size: 12px;
+	line-height: 1.4;
+	color: #a59e86;
+}
+
+.elderward-brand-version {
+	flex: 0 0 auto;
+	align-self: flex-start;
+	font-family: Menlo, Consolas, monaco, monospace;
+	font-size: 11px;
+	color: #4f8676;
+}
+
+.elderward-wrap .wp-header-end {
+	margin: 0;
+}
+
+@media (max-width: 600px) {
+	.elderward-wrap .elderward-brand { padding: 14px 16px; gap: 14px; }
+	.elderward-brand-mark { width: 48px; height: 48px; }
+	.elderward-brand-word { height: 28px; }
+	.elderward-brand-version { display: none; }
+}
+
 .elderward-card {
 	background: #fff;
 	border: 1px solid #c3c4c7;
@@ -88,3 +151,7 @@
 	overflow: auto;
 	max-width: 900px;
 }
+.elderward-wrap > .description {
+	max-width: 900px;
+}
+

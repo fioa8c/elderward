@@ -270,7 +270,16 @@ final class Elderward_Admin
         $root = untrailingslashit(ABSPATH);
         ?>
         <div class="wrap elderward-wrap">
-            <h1><?php esc_html_e('Elderward', 'elderward'); ?></h1>
+            <h1 class="screen-reader-text"><?php esc_html_e('Elderward', 'elderward'); ?></h1>
+            <header class="elderward-brand">
+                <img class="elderward-brand-mark" src="<?php echo esc_url(ELDERWARD_URL . 'assets/img/elderward-mark.svg'); ?>" alt="" width="64" height="64" />
+                <div class="elderward-brand-text">
+                    <img class="elderward-brand-word" src="<?php echo esc_url(ELDERWARD_URL . 'assets/img/elderward-wordmark.svg'); ?>" alt="<?php esc_attr_e('Elderward', 'elderward'); ?>" width="124" height="34" />
+                    <p class="elderward-brand-tag"><?php esc_html_e('Malware scanner and incident response for WordPress', 'elderward'); ?></p>
+                </div>
+                <span class="elderward-brand-version"><?php echo esc_html('v' . ELDERWARD_VERSION); ?></span>
+            </header>
+            <hr class="wp-header-end" />
             <p class="description">
                 <?php esc_html_e('A report-only look at this install: quick checks, core/plugin/theme integrity, timestamps, crontab, database and (optionally) access logs, then the malware signatures in dry-run mode. Nothing is modified.', 'elderward'); ?>
             </p>
