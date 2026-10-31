@@ -21,6 +21,15 @@ final class Elderward_Job
     const LOCK_OPTION = 'elderward_job_lock';
     const LOCK_SECONDS = 90;
     const MAX_BUDGET_SECONDS = 10;
+    // A unit whose request died this many times (memory limit, server
+    // timeout) fails the job instead of being retried forever.
+    const MAX_ATTEMPTS = 3;
+
+    // The job a step is running, until the step ends normally. The shutdown
+    // handler uses it to record a fatal error that would otherwise leave the
+    // job "running" with no message and a stale lock.
+    private static $in_flight = null;
+    private static $shutdown_registered = false;
 
     public static function current()
     {
@@ -104,10 +113,18 @@ final class Elderward_Job
             // Another request is stepping this job; report its state.
             return $job;
         }
+        // Re-read under the lock: the copy above may predate a step that
+        // finished (or a stale lock that was just taken over).
+        $job = self::current();
+        if (null === $job || 'running' !== $job['status']) {
+            self::release_lock();
+            return $job;
+        }
 
         wp_raise_memory_limit('admin');
         $budget = self::budget_seconds();
         $deadline = microtime(true) + $budget;
+        self::watch($job);
 
         $reporter = new Elderward_Store_Reporter($job['id'], $job['counts']);
         $ctx = Elderward_Plugin::make_context($job['options'], $reporter, self::work_dir($job['id']));
@@ -141,7 +158,18 @@ final class Elderward_Job
                     continue;
                 }
 
-                $unit = array_shift($job['queue']);
+                // The attempt is recorded (and the job saved) with the unit
+                // still at the head of the queue: a request that dies must
+                // retry the unit, not skip it.
+                $unit = $job['queue'][0];
+                $failure = self::record_attempt($job, $stage, $unit);
+                if (null !== $failure) {
+                    $job['error'] = $failure;
+                    $job = self::complete($job, 'failed');
+                    break;
+                }
+                self::$in_flight = $job;
+                array_shift($job['queue']);
                 $next = $scanner->run($unit, $job['state']);
                 if (null !== $next) {
                     $job['queue'] = array_merge(Elderward\Engine\Scanner::as_unit_list($next), $job['queue']);
@@ -163,8 +191,102 @@ final class Elderward_Job
             $job = self::complete($job, 'failed');
         }
 
+        self::$in_flight = null;
         self::release_lock();
         return $job;
+    }
+
+    /**
+     * Count how often the same unit has been started. The record is saved
+     * before the unit runs, so a request that dies without a trace (killed
+     * by the web server) still leaves a mark; after MAX_ATTEMPTS the job
+     * fails with an explanation instead of looping. Returns the failure
+     * message or null.
+     */
+    private static function record_attempt(array &$job, $stage, array $unit)
+    {
+        $key = md5($stage . '|' . $job['stage_index'] . '|' . wp_json_encode($unit));
+        if (isset($job['attempt']) && $job['attempt']['key'] === $key) {
+            $job['attempt']['n']++;
+        } else {
+            $job['attempt'] = array('key' => $key, 'n' => 1);
+        }
+        if ($job['attempt']['n'] > self::MAX_ATTEMPTS) {
+            return sprintf(
+                /* translators: 1: stage name, 2: number of attempts */
+                __('The step running "%1$s" was cut short %2$d times without finishing (PHP memory limit or a server timeout). The PHP error log has the details; the WP-CLI command for this check runs without the request limits.', 'elderward'),
+                Elderward\Engine\Runner::stage_label($stage),
+                self::MAX_ATTEMPTS
+            );
+        }
+        $job = self::save($job);
+        return null;
+    }
+
+    /**
+     * Arrange for a step that dies to be recorded. WordPress's fatal error
+     * handler is a shutdown function registered before any plugin loads and
+     * it ends the process with wp_die(), so a shutdown function of our own
+     * would never run after it; the wp_php_error_message filter fires inside
+     * that handler, before it dies. The shutdown function stays as the
+     * fallback for sites that disabled the WordPress handler.
+     */
+    private static function watch(array $job)
+    {
+        self::$in_flight = $job;
+        if (!self::$shutdown_registered) {
+            self::$shutdown_registered = true;
+            add_filter('wp_php_error_message', array(__CLASS__, 'on_php_error'), 1, 2);
+            register_shutdown_function(array(__CLASS__, 'on_shutdown'));
+        }
+    }
+
+    public static function on_php_error($message, $error)
+    {
+        self::record_fatal(is_array($error) ? $error : null);
+        return $message;
+    }
+
+    public static function on_shutdown()
+    {
+        self::record_fatal(error_get_last());
+    }
+
+    /**
+     * If a step did not end normally and PHP recorded a fatal error, mark
+     * the job failed with that message so the page shows it right away, and
+     * release the lock instead of letting it expire 90 seconds later.
+     */
+    private static function record_fatal($error)
+    {
+        if (null === self::$in_flight) {
+            return;
+        }
+        $job = self::$in_flight;
+        self::$in_flight = null;
+        $fatal = array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR);
+        if (!is_array($error) || !isset($error['type']) || !in_array((int) $error['type'], $fatal, true)) {
+            // Nothing recorded (for instance exit() elsewhere): leave the
+            // attempt counter to decide on the next request.
+            self::release_lock();
+            return;
+        }
+        $current = self::current();
+        if (null === $current || $current['id'] !== $job['id'] || 'running' !== $current['status']) {
+            self::release_lock();
+            return;
+        }
+        $message = isset($error['message']) ? (string) $error['message'] : '';
+        $file = isset($error['file']) ? basename((string) $error['file']) : '';
+        $current['error'] = sprintf(
+            /* translators: 1: PHP error message, 2: file name, 3: line number */
+            __('PHP stopped the request: %1$s (%2$s:%3$d). The WP-CLI command for this check runs without the request limits.', 'elderward'),
+            wp_strip_all_tags($message),
+            $file,
+            isset($error['line']) ? (int) $error['line'] : 0
+        );
+        self::complete($current, 'failed');
+        self::release_lock();
     }
 
     public static function cancel()
@@ -215,10 +337,18 @@ final class Elderward_Job
     private static function budget_seconds()
     {
         $max = (int) ini_get('max_execution_time');
-        if ($max <= 0) {
-            return self::MAX_BUDGET_SECONDS;
+        $budget = self::MAX_BUDGET_SECONDS;
+        if ($max > 0) {
+            $budget = max(2, min(self::MAX_BUDGET_SECONDS, (int) floor($max * 0.6)));
         }
-        return max(2, min(self::MAX_BUDGET_SECONDS, (int) floor($max * 0.6)));
+        /**
+         * Seconds of work one admin-ajax step may do before it saves and
+         * returns. Lower it on hosts that kill requests early.
+         *
+         * @param float $budget Seconds (default min(10, 0.6 x max_execution_time)).
+         */
+        $budget = (float) apply_filters('elderward_step_budget_seconds', $budget);
+        return ($budget > 0) ? $budget : (float) self::MAX_BUDGET_SECONDS;
     }
 
     // add_option is atomic on the option_name unique key, which makes it a

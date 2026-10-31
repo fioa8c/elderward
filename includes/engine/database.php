@@ -101,6 +101,15 @@ class DatabaseScanner extends Scanner
         if (null !== $failure) {
             throw new Fatal($failure);
         }
+        if ((int) $unit['after'] > 0) {
+            ///////////////
+            // A continuation (only the paused web job produces one): say how
+            // far the table has been read so a long stage visibly moves.
+            //////////////
+            $seen = ('posts' === $unit['table']) ? $state['counts']['FLAGGED_POSTS'] . ' flagged post(s) so far'
+                : (('options' === $unit['table']) ? $state['counts']['OPTIONS'] . ' options checked' : $state['counts']['ADMINS'] . ' administrator(s) listed');
+            $this->progress('Scanning database: ' . $unit['table'] . ' past id ' . (int) $unit['after'] . ', ' . $seen . "\n");
+        }
         switch ($unit['table']) {
             case 'admins':
                 return ($this->scan_admins((int) $unit['after'], $state));
