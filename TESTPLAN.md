@@ -21,7 +21,7 @@ find /tmp/ew/wordpress -exec touch {} +
 
 **A1.** `php -l elderward.php` → `No syntax errors detected`.
 
-**A2.** `$EW help=1` → usage screen listing scandirectory, scan_all, dryrun, scancron, scanlog, scanintegrity, checksumdir, locale, scantimes, help.
+**A2.** `$EW help=1` → usage screen listing scandirectory, allfiles, dryrun, scancron, scanlog, scanintegrity, checksumdir, locale, scantimes, help.
 
 **A3. Cleanup engine.**
 
@@ -50,6 +50,17 @@ $EW scanlog=/tmp/ew/access.log
 ```
 
 Expect: `HIGH,LOG_IOC,...access.uploads.php...`, two `MEDIUM,LOG_IOC` lines (env probe, code injection), example lines indented, and a top-source-IP list.
+
+**A5. Blocked checks are ERROR findings, not silent passes.**
+
+```sh
+php -d disable_functions=shell_exec elderward.php scancron=1; echo "exit=$?"
+$EW scancron=1; echo "exit=$?"
+mkdir -p /tmp/ew/logs && ln -sf /nonexistent/access.log.1.gz /tmp/ew/logs/access.log.1.gz && cp /tmp/ew/access.log /tmp/ew/logs/
+$EW scanlog=/tmp/ew/logs; echo "exit=$?"
+```
+
+Expect: the first command prints `ERROR,CRONTAB_UNAVAILABLE,crontab,crontab NOT checked: shell_exec is not available...` and exits 2. The second prints `No crontab for the current user.` (exit 0) when the user has none, the usual `CRONTAB_IOC` lines when it has malicious entries, or `CRONTAB_UNAVAILABLE` with the `crontab -l` error if the binary is missing. The directory log scan prints `ERROR,LOG_UNREADABLE,/tmp/ew/logs/access.log.1.gz,log NOT scanned: cannot open it (permissions?)` alongside the A4 findings (on a host without zlib a real `.gz` reports `compressed log NOT scanned: PHP zlib extension not available`); the exit code is 3 because of the HIGH log IoC.
 
 ---
 
@@ -154,6 +165,36 @@ $EW scanintegrity=1 scandirectory=$WP
 ```
 
 Expect: `INFO,INTEGRITY_RESTORED,...functions.php,core <ver>: pristine copy restored...` and a clean rescan. This is the one live path with no offline equivalent tested (the full core zip download + `wordpress/` prefix extraction), so **PASTE the output either way.**
+
+---
+
+## E. Database scan (needs a real WordPress DB)
+
+Run against `$WP` (or a copy of a real site). The scan is **read-only** — it issues only SELECTs — but run it against a staging copy if you're cautious.
+
+**E1. Baseline on a clean install.** `$EW scandb=1 scandirectory=$WP`
+
+Expect: a `DB_ADMIN_USER` INFO line per administrator, `DB_SITE_URL` INFO lines for `siteurl`/`home`, and `0 flagged options, 0 flagged posts`. On a fresh install this should be all INFO (exit 0). **PASTE the output** — real sites carry legitimate `<script src=...>` analytics snippets in options that flag as `DB_OPTION_IOC` (MEDIUM); those are the tuning input for the option signatures.
+
+**E2. Planted artifacts are caught.** On a throwaway DB:
+
+```sql
+INSERT INTO wp_options (option_name, option_value) VALUES ('ew_test','<script>eval(atob("eA=="))</script>');
+UPDATE wp_options SET option_value='http://evil.example/' WHERE option_name='siteurl';
+-- create a fresh admin through wp-admin, or:
+-- INSERT a user + wp_usermeta row with meta_key wp_capabilities LIKE '%administrator%'
+```
+
+Expect: `HIGH,DB_OPTION_IOC` for `ew_test` with the `e.g.` excerpt showing the `eval(atob(` itself, `HIGH,DB_SITE_URL` for the non-URL... (`http://evil.example/` is a valid URL so it reports INFO — the point is it should now differ from your real address, which the operator eyeballs), and `MEDIUM,DB_NEW_ADMIN` for the new admin. Remember to restore `siteurl` afterward or the site breaks.
+
+Role tampering: with a role-editor plugin (or by editing `wp_user_roles` directly) grant `manage_options` to the Subscriber role. Expect `MEDIUM,DB_ROLE_CAPS,db:wp_options:wp_user_roles,role "subscriber" holds administrator-level capabilities: manage_options ...`. The Editor role's default `unfiltered_html` must NOT flag. Save a few revisions of a post containing `<?php` — expect exactly one `DB_POST_IOC` for the live post, none for the revisions.
+
+**E3. Non-standard setups.** If your site uses a custom `$table_prefix`, external DB host, or has `wp-config.php` one level above the web root, confirm E1 still connects. **PASTE any connection error** — DB_HOST parsing (socket vs port vs IPv6) is the most likely real-world snag. A commented-out `// define('DB_HOST', ...)` left above the live one must be ignored.
+
+**E4. Failures are loud, not silent.** Temporarily set a wrong `DB_PASSWORD` (or `$table_prefix`) in a *copy* of wp-config.php and point `scandirectory` at that copy's root:
+
+- `$EW scandb=1 scandirectory=$COPY` → `Error: could not connect ...`, exit 1; with `format=json` the only stdout line is `{"event":"error",...}`.
+- `$EW scanall=1 scandirectory=$COPY` → the sorted report contains `ERROR,DB_UNAVAILABLE,...wp-config.php,... the database was NOT scanned` and exit is at least 2. With a wrong prefix instead: three `ERROR,DB_QUERY_FAILED` lines (users, options, posts).
 
 ---
 
