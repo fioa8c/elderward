@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Elderward</title>
-<meta name="description" content="Elderward é um scanner de malware gratuito, em um único arquivo PHP, para sites WordPress comprometidos. Remove malware conhecido, verifica core, plugins e temas, e lê os logs de acesso para mostrar como o invasor entrou.">
+<meta name="description" content="Elderward é um scanner de malware gratuito, em um único arquivo PHP, para sites WordPress comprometidos. Remove malware conhecido, verifica core, plugins e temas, examina o banco de dados e lê os logs de acesso para mostrar como o invasor entrou.">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#061614">
 <meta property="og:title" content="Elderward">
@@ -242,7 +242,7 @@ h2 {
 .term pre {
   margin: 0;
   padding: 1.1em 1.2em 1.3em;
-  min-height: 25.5em;
+  min-height: 29em;
   overflow-x: auto;
   font-family: var(--mono);
   font-size: .92rem;
@@ -510,7 +510,7 @@ footer {
     <header class="hero">
       <div class="hero-text">
         <h1>Elderward</h1>
-        <p class="lede">Um único arquivo PHP que encontra o que se infiltrou num site WordPress, arranca o malware que conhece e lê os logs de acesso para mostrar por onde ele entrou.</p>
+        <p class="lede">Um script em PHP para encontrar códigos maliciosos num site WordPress, remove malwares, verifica a integridade da sua instalação, e lê os logs de acesso para mostrar por onde ele entrou.</p>
 
         <div class="cmd">
           <pre id="cmd-hero"><span class="p">$ </span>curl -O https://raw.githubusercontent.com/fioa8c/elderward/main/elderward.php
@@ -520,7 +520,7 @@ footer {
 
         <p class="links">
           <a href="https://github.com/fioa8c/elderward">Ver o código no GitHub</a>
-          <a href="https://raw.githubusercontent.com/fioa8c/elderward/main/elderward.php">Ver o código do elderward.php</a>
+          <a href="https://raw.githubusercontent.com/fioa8c/elderward/main/elderward.php">Ver o código fonte do elderward.php</a>
         </p>
       </div>
 
@@ -530,8 +530,8 @@ footer {
     </header>
 
     <section aria-labelledby="h-first-look">
-      <h2 id="h-first-look">Primeira olhada num servidor comprometido</h2>
-      <p class="sub"><code>scanall=1</code> roda todos os scanners sem alterar nada e imprime uma lista só, do mais grave ao mais leve. O código de saída diz ao cron e ao CI o tamanho do estrago.</p>
+      <h2 id="h-first-look">Executando o script num servidor comprometido</h2>
+      <p class="sub"><code>scanall=1</code> roda todos os scanners sem alterar nada e exibe uma lista só, do mais grave ao mais leve. Relatório mostra o tamanho do estrago.</p>
 
       <div class="term">
         <div class="term-bar">
@@ -543,21 +543,21 @@ footer {
     </section>
 
     <section aria-labelledby="h-modes">
-      <h2 id="h-modes">Sete maneiras de olhar</h2>
-      <p class="sub">Cada modo de varredura é uma flag. Eles rodam separadamente, exceto o <code>scanall</code>, que roda todos e também pode incluir seus logs.</p>
+      <h2 id="h-modes">Oito tipos de scanner</h2>
+      <p class="sub">Cada modo de varredura é uma flag, e cada execução aceita um modo só. A exceção é o <code>scanall</code>, que roda todos.</p>
 
       <dl class="modes">
         <div class="mode">
           <dt><span class="name">Limpeza por assinatura</span>php elderward.php</dt>
-          <dd>Percorre a árvore de arquivos e identifica injeções conhecidas, como as campanhas JavaScript <code>ndsw</code>/<code>ndsx</code> e <code>wqpq</code>, e as remove. Adicione <code>dryrun=1</code> para ver antes o que seria alterado.</dd>
+          <dd>É o modo padrão, então altera arquivos: percorre a árvore, identifica injeções conhecidas, como as campanhas JavaScript <code>ndsw</code>/<code>ndsx</code> e <code>wqpq</code>, e as remove. Adicione <code>dryrun=1</code> para ver antes o que seria alterado, e <code>allfiles=1</code> para varrer todos os arquivos, não só as extensões de risco (antes era <code>scan_all=1</code>).</dd>
         </div>
         <div class="mode">
           <dt><span class="name">Tudo, só relatório</span>scanall=1</dt>
-          <dd>Todos os scanners numa passada, do mais grave ao mais leve. A limpeza por assinatura é forçada a rodar em modo de simulação e <code>restore=1</code> é ignorado, então nada no disco muda.</dd>
+          <dd>Verificações rápidas, integridade, datas, crontab, banco de dados e, com <code>scanlog=</code>, logs de acesso, e depois a varredura por assinatura. Só gera relatório, então nada no disco muda. Leia o relatório e depois corrija com os modos específicos, uma execução por vez.</dd>
         </div>
         <div class="mode">
           <dt><span class="name">Integridade</span>scanintegrity=1</dt>
-          <dd>Compara o core do WordPress, cada plugin e cada tema com o pacote oficial do wordpress.org da versão instalada. Aponta arquivos modificados, ausentes e sobrando. PHP sobrando dentro do core ou de um plugin é o clássico webshell plantado. Funciona offline com <code>checksumdir=</code>.</dd>
+          <dd>Compara o core do WordPress, cada plugin e cada tema com o pacote oficial do wordpress.org da versão instalada. Aponta arquivos modificados, ausentes e sobrando. PHP sobrando dentro do core ou de um plugin é o clássico webshell plantado. Funciona offline com <code>checksumdir=</code>. Para um core em português, passe <code>locale=pt_BR</code>, senão os arquivos traduzidos aparecem como modificados.</dd>
         </div>
         <div class="mode">
           <dt><span class="name">Logs de acesso</span>scanlog=/var/log/apache2</dt>
@@ -568,12 +568,16 @@ footer {
           <dd>Os esconderijos baratos dos invasores: PHP executável em <code>wp-content/uploads</code>, ganchos <code>auto_prepend_file</code> em <code>.user.ini</code> e <code>.htaccess</code>, mu-plugins que carregam sem precisar de ativação e arquivos PHP ocultos (começando com ponto).</dd>
         </div>
         <div class="mode">
+          <dt><span class="name">Banco de dados</span>scandb=1</dt>
+          <dd>Lê o banco de dados com as credenciais do <code>wp-config.php</code>, usando só consultas SELECT. Lista todos os administradores e aponta os criados nos últimos 30 dias, papéis que não são de admin mas ganharam poderes como <code>manage_options</code>, código injetado em opções e posts, <code>siteurl</code> ou <code>home</code> sequestrados e <code>active_plugins</code> adulterado.</dd>
+        </div>
+        <div class="mode">
           <dt><span class="name">Datas de modificação</span>scantimes=1</dt>
           <dd>Arquivos alterados depois do resto do pacote, e PHP cuja data de modificação foi recuada com <code>touch</code> enquanto o ctime do inode ficou onde estava. São pistas, não provas.</dd>
         </div>
         <div class="mode">
           <dt><span class="name">Crontab</span>scancron=1</dt>
-          <dd>O crontab do usuário atual, verificado em busca de persistência: decodificadores base64 encadeados por pipe, downloads do pastebin e droppers em diretórios tmp.</dd>
+          <dd>Roda <code>crontab -l</code> como o usuário do PHP e procura persistência: decodificadores base64 encadeados por pipe, downloads do pastebin e droppers em diretórios tmp. Crontabs de outros usuários e <code>/etc/cron.*</code> ficam de fora.</dd>
         </div>
       </dl>
     </section>
@@ -607,6 +611,14 @@ footer {
           <strong>Palpites nunca tocam no disco</strong>
           <p>Achados de datas e de correlação com logs são pistas para você seguir. Nunca disparam uma limpeza ou restauração.</p>
         </li>
+        <li>
+          <strong>Verificação bloqueada não passa em silêncio</strong>
+          <p>Uma extensão ausente, um banco inacessível ou um log ilegível vira um achado ERROR, nunca é pulado em silêncio. Um relatório limpo significa que todos os scanners de fato olharam.</p>
+        </li>
+        <li>
+          <strong>O banco de dados só é lido</strong>
+          <p>O <code>scandb</code> roda apenas consultas SELECT, lê o <code>wp-config.php</code> sem executá-lo e nunca faz unserialize dos valores guardados, o que poderia disparar uma injeção de objeto PHP.</p>
+        </li>
       </ul>
     </section>
 
@@ -622,7 +634,7 @@ footer {
         </div>
         <div>
           <h3>JSON</h3>
-          <p><code>format=json</code> imprime um evento por linha no stdout e manda o progresso para o stderr, então o stdout continua legível por máquina.</p>
+          <p><code>format=json</code> imprime um evento por linha no stdout e manda o progresso para o stderr, então o stdout continua legível por máquina. Até um erro fatal chega como um evento <code>error</code>.</p>
           <pre>{"event":"finding","severity":"HIGH",
  "type":"LOG_IOC","path":"...","detail":"..."}</pre>
         </div>
@@ -644,8 +656,11 @@ footer {
       <div class="get">
         <div>
           <ul>
-            <li>PHP 5.6 ou mais novo. A extensão zlib só é necessária para logs <code>.gz</code>, e a zip só para verificar temas e restaurar arquivos.</li>
+            <li>PHP 5.6 ou mais novo. A varredura por assinatura, as verificações rápidas e as datas não precisam de mais nada.</li>
+            <li>Os outros scanners usam extensões que alguns servidores não têm: zlib para logs <code>.gz</code>, curl ou <code>allow_url_fopen</code> para a verificação de integridade online, zip para temas e qualquer restauração, mysqli para o <code>scandb</code> e <code>shell_exec</code> para o <code>scancron</code>. A falta de uma delas aparece como ERROR.</li>
             <li>Acesso ao shell, ou a possibilidade de subir um arquivo PHP e acessá-lo por HTTP.</li>
+            <li>Aponte o <code>scandirectory=</code> para a raiz do WordPress, o diretório que contém <code>wp-includes/</code>. <code>scanall</code>, <code>scanintegrity</code>, <code>scandb</code>, <code>quickscan</code> e <code>scantimes</code> precisam disso.</li>
+            <li>Os argumentos são lidos como uma query string de URL: coloque entre aspas caminhos com espaços ou <code>&amp;</code>, e escreva <code>+</code> como <code>%2B</code>.</li>
             <li>Sem shell? Defina um <code>WEB_ACCESS_TOKEN</code> longo e aleatório no topo do arquivo, passe-o como <code>?token=</code> e apague o arquivo quando terminar.</li>
           </ul>
           <div class="warning">
@@ -657,6 +672,10 @@ footer {
           <div class="cmd">
             <pre id="cmd-dry"><span class="p">$ </span>php elderward.php dryrun=1 scandirectory=/path/to/site</pre>
             <button class="copy" type="button" data-copy="cmd-dry">Copiar</button>
+          </div>
+          <div class="cmd">
+            <pre id="cmd-db"><span class="p">$ </span>php elderward.php scandb=1 scandirectory=/path/to/wp-root</pre>
+            <button class="copy" type="button" data-copy="cmd-db">Copiar</button>
           </div>
           <div class="cmd">
             <pre id="cmd-logs"><span class="p">$ </span>php elderward.php scanlog=/var/log/apache2 correlate=1 scandirectory=/path/to/wp-root</pre>
@@ -1024,6 +1043,8 @@ footer {
     { sev: "HIGH", rest: ",CRONTAB_IOC,crontab,crontab.tmp.006: * * * * * echo ... | base64 --decode > /tmp/x" },
     { sev: "HIGH", rest: ",LOG_IOC,/var/log/apache2/access.log,access.uploads.php: 37 hit(s) - PHP file requested inside wp-content/uploads." },
     { ctx: "    e.g. 203.0.113.66 - - [12/Mar/2024:03:14:07 +0000] \"POST /wp-content/uploads/2024/03/cache.php HTTP/1.1\" 200" },
+    { sev: "HIGH", rest: ",DB_OPTION_IOC,db:wp_options:widget_text,db.option.hidden-iframe: Hidden iframe inside an option value - a classic drive-by injection" },
+    { sev: "MEDIUM", rest: ",DB_NEW_ADMIN,db:wp_users:ID=7,administrator \"wp-sync\" <wp-sync@example.com> registered 2024-03-12 03:16:40 - created within the last 30 days, the classic takeover artifact; verify who created it" },
     { sev: "MEDIUM", rest: ",LOG_IOC,/var/log/apache2/access.log.2.gz,access.xmlrpc.flood: 4182 hit(s) - High volume of xmlrpc.php POSTs, typically credential brute forcing via system.multicall or pingback abuse." },
     { sev: "MEDIUM", rest: ",TIMESTAMP_OUTLIER,/var/www/html/wp-content/themes/astra/functions.php,theme astra: modified 2024-03-12 03:15 but 412 of 418 files cluster around 2024-01-08 10:02" },
     { sev: "LOW", rest: ",INTEGRITY_MISSING,/var/www/html/wp-admin/css/about.min.css,core 6.6.2: file from the official package is missing" },
