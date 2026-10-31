@@ -354,13 +354,13 @@ $CRONTAB_SIGS = array(
 	array( 'crontab.tmp.002' => '@php -q [^\.]+\/\.cron@'),
     array( 'crontab.tmp.003' => '@wget\shttp[^-]*\.txt\s*\-O\s\/wp-\w+\/[^>]*\>\/dev\/null;\sfetch\s-o\s\/wp-\w+[^\>]*\.txt\s\>.dev.null\s*2>\&1;\stouch\s-t\s\d+\s\/wp-\w+[^;]*null;\schmod\s0755[^;]*null;\srm\s-f\s+[^;]*null;\stouch\s-t\s\d+\s[^>]*\>.dev.null@'),
     array( 'crontab.tmp.004' => '@&& chmod 0755 xxxd@'),
-    array( 'crontab.tmp.004.02' => '@(wget|curl) .+&& \/bin\/sh \w{4,} \/[^&]+&& rm -f \w@'),
-    array( 'crontab.tmp.005' => '@.php && chmod +x /@'),
-    array( 'crontab.tmp.006' => '@\|\s*base64 --decode\s*>@'),
-    array( 'crontab.tmp.007' => '@\.file_get_contents\(.https:\/\/bit.ly\/\w@'),
-    array( 'crontab.tmp.008' => '@\|base64 -d\|gunzip -c\)@'),
-    array( 'crontab.tmp.009' => '@https:\/\/pastebin.com\/raw@'),
-    array( 'crontab.tmp.010' => '@eval.gzinflate.base64_decode@'),
+    array( 'crontab.tmp.005' => '@(wget|curl) .+&& \/bin\/sh \w{4,} \/[^&]+&& rm -f \w@'),
+    array( 'crontab.tmp.006' => '@.php && chmod +x /@'),
+    array( 'crontab.tmp.007' => '@\|\s*base64 --decode\s*>@'),
+    array( 'crontab.tmp.008' => '@\.file_get_contents\(.https:\/\/bit.ly\/\w@'),
+    array( 'crontab.tmp.009' => '@\|base64 -d\|gunzip -c\)@'),
+    array( 'crontab.tmp.010' => '@https:\/\/pastebin.com\/raw@'),
+    array( 'crontab.tmp.011' => '@eval.gzinflate.base64_decode@'),
 );
 
 function scanCronTab()
