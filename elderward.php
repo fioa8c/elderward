@@ -58,8 +58,7 @@ if (isset($_GET['help'])) {
     echo "\n";
     echo "Options:\n";
     echo "  scandirectory=/path   Directory to scan for malware (default: current directory)\n";
-    echo "  scan_all=1            Scan every file, not just known-risky extensions (this is\n";
-    echo "                        a signature-scan option; to run every scanner use scanall=1)\n";
+    echo "  allfiles=1            Scan every file, not just known-risky extensions\n";
     echo "  dryrun=1              Report what would be cleaned without writing any file\n";
     echo "  scancron=1            Scan the current user's crontab for known malicious entries\n";
     echo "  scanlog=/path         Scan an access log (file or directory of logs, .gz supported)\n";
@@ -283,7 +282,7 @@ function is_scannable_file($file)
     if ($file->getRealPath() === __FILE__) {
         return (false);
     }
-    return isset($_GET['scan_all'])
+    return isset($_GET['allfiles'])
         || in_array(strtolower($file->getExtension()), $extensions_to_check, true);
 }
 
@@ -2326,6 +2325,12 @@ if (count($requested_modes) > 1 && $requested_modes !== array('scanall', 'scanlo
     fatal_error('scan modes are mutually exclusive, run them one at a time: ' . implode(', ', $requested_modes));
 }
 
+// The old name for allfiles=1 was one underscore away from scanall=1 and
+// meant something else entirely; refuse it rather than guess.
+if ( isset($_GET['scan_all']) ) {
+    fatal_error('scan_all=1 has been renamed: use allfiles=1 to scan every file extension, or scanall=1 to run every scanner');
+}
+
 if ( isset($_GET['correlate']) && !isset($_GET['scanlog']) ) {
     fatal_error('correlate=1 needs scanlog=/path to know which traffic to correlate against');
 }
@@ -2392,7 +2397,7 @@ function run_signature_scan($scan_dir)
 
         //////////
         //// Skip this script itself and anything outside the risky-extension
-        //// list (scan_all=1 overrides) - shared with the correlate walk.
+        //// list (allfiles=1 overrides) - shared with the correlate walk.
         /////////
         if ( !is_scannable_file($file) ) {
             continue;

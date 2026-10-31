@@ -36,12 +36,12 @@ Fixing what was found:
 ```
 php elderward.php dryrun=1 scandirectory=/path/to/site   # preview the signature cleanup, write nothing
 php elderward.php scandirectory=/path/to/site            # remove known malware from infected files
-php elderward.php scan_all=1 scandirectory=/path/to/site # ... scanning every file, not just risky extensions
+php elderward.php allfiles=1 scandirectory=/path/to/site # ... scanning every file, not just risky extensions
 php elderward.php scanintegrity=1 restore=1 dryrun=1 scandirectory=/path/to/wp-root  # preview restore
 php elderward.php scanintegrity=1 restore=1 quarantinedir=/safe/place scandirectory=/path/to/wp-root
 ```
 
-Note the two similarly named options: `scan_all=1` widens the *signature scan* to every file extension, while `scanall=1` runs *every scanner*. The signature cleanup is the default mode, so with no mode option the script modifies files; `dryrun=1` is the switch that makes it report-only.
+The signature cleanup is the default mode, so with no mode option the script modifies files; `dryrun=1` is the switch that makes it report-only. (`allfiles=1` was called `scan_all=1` in earlier versions; the old name now stops with an error because it was too easy to confuse with `scanall=1`.)
 
 Running one scanner at a time:
 

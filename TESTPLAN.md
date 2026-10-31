@@ -21,7 +21,7 @@ find /tmp/ew/wordpress -exec touch {} +
 
 **A1.** `php -l elderward.php` → `No syntax errors detected`.
 
-**A2.** `$EW help=1` → usage screen listing scandirectory, scan_all, dryrun, scancron, scanlog, scanintegrity, checksumdir, locale, scantimes, help.
+**A2.** `$EW help=1` → usage screen listing scandirectory, allfiles, dryrun, scancron, scanlog, scanintegrity, checksumdir, locale, scantimes, help.
 
 **A3. Cleanup engine.**
 
