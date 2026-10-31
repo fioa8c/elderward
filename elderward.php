@@ -58,7 +58,8 @@ if (isset($_GET['help'])) {
     echo "\n";
     echo "Options:\n";
     echo "  scandirectory=/path   Directory to scan for malware (default: current directory)\n";
-    echo "  scan_all=1            Scan every file, not just known-risky extensions\n";
+    echo "  scan_all=1            Scan every file, not just known-risky extensions (this is\n";
+    echo "                        a signature-scan option; to run every scanner use scanall=1)\n";
     echo "  dryrun=1              Report what would be cleaned without writing any file\n";
     echo "  scancron=1            Scan the current user's crontab for known malicious entries\n";
     echo "  scanlog=/path         Scan an access log (file or directory of logs, .gz supported)\n";
@@ -66,10 +67,12 @@ if (isset($_GET['help'])) {
     echo "  correlate=1           With scanlog: also report files under scandirectory whose\n";
     echo "                        mtime falls within window (default 300s) of flagged traffic\n";
     echo "  window=seconds        Correlation window around flagged requests (min 60)\n";
-    echo "  scanintegrity=1       Verify core and plugin files against wordpress.org checksums.\n";
+    echo "  scanintegrity=1       Verify core, plugin and theme files against the official\n";
+    echo "                        wordpress.org packages (themes need the PHP zip extension).\n";
     echo "                        scandirectory must be the WordPress root (default: current dir)\n";
-    echo "  checksumdir=/path     Use pre-downloaded checksum manifests instead of the network\n";
-    echo "                        (core-{version}.json, plugin-{slug}-{version}.json)\n";
+    echo "  checksumdir=/path     Use pre-downloaded manifests and packages instead of the network\n";
+    echo "                        (core-{version}.json, plugin-{slug}-{version}.json,\n";
+    echo "                        theme-{slug}-{version}.zip; *.zip of core/plugins for restore)\n";
     echo "  locale=xx_XX          Core locale for the checksum lookup (default: en_US)\n";
     echo "  restore=1             With scanintegrity: restore MODIFIED and MISSING files from\n";
     echo "                        the official package zips (byte-verified against the checksum\n";
@@ -97,6 +100,9 @@ if (isset($_GET['help'])) {
     echo "\n";
     echo "Exit codes: 0 clean (or INFO-only findings), 1 usage/fatal error,\n";
     echo "            2 LOW/MEDIUM/ERROR findings, 3 HIGH findings\n";
+    echo "\n";
+    echo "Arguments are parsed like a URL query string: encode '+' as %2B and '%' as %25\n";
+    echo "in paths, and quote paths containing spaces or '&'.\n";
     die();
 }
 
@@ -362,23 +368,48 @@ function scanCronTab()
 {
     global $CRONTAB_SIGS;
 
-    if (function_exists('shell_exec')) {
-        $output = @shell_exec('crontab -l 2>/dev/null');
-        if (is_string($output) && is_array($CRONTAB_SIGS)) {
-            $lines = explode("\n", $output);
+    ///////////////
+    // A crontab that could not be read is an ERROR finding, never a silent
+    // pass: shell_exec is disabled on much shared hosting (function_exists
+    // still says yes for a disable_functions entry), and "no crontab" has
+    // to be told apart from "crontab failed".
+    //////////////
+    $disabled = array_map('trim', explode(',', (string) ini_get('disable_functions')));
+    if (!function_exists('shell_exec') || in_array('shell_exec', $disabled, true)) {
+        report_finding('ERROR', 'CRONTAB_UNAVAILABLE', 'crontab', 'crontab NOT checked: shell_exec is not available in this PHP (run "crontab -l" by hand, or from the host\'s shell)');
+        return;
+    }
 
-            foreach ($lines as $line) {
-                if ((trim($line) === "") || ((strlen($line) > 0) && ('#'==$line[0]))) {
-                    continue;
-                }
+    $output = @shell_exec('crontab -l 2>&1; echo "__ELDERWARD_RC=$?"');
+    if (!is_string($output) || !preg_match('/__ELDERWARD_RC=(\d+)\s*$/', $output, $matches)) {
+        report_finding('ERROR', 'CRONTAB_UNAVAILABLE', 'crontab', 'crontab NOT checked: shell_exec produced no output (disabled by the host?)');
+        return;
+    }
+    $rc = (int) $matches[1];
+    $output = (string) preg_replace('/__ELDERWARD_RC=\d+\s*$/', '', $output);
 
-                foreach ($CRONTAB_SIGS as $item) {
-                    foreach ($item as $name => $pattern) {
-                        if (preg_match($pattern, $line)) {
-                            report_finding('HIGH', 'CRONTAB_IOC', 'crontab', $name . ': ' . $line);
-                            break 2;
-                        }
-                    }
+    if (0 !== $rc) {
+        if (preg_match('/no crontab for/i', $output)) {
+            progress("No crontab for the current user.\n");
+            return;
+        }
+        report_finding('ERROR', 'CRONTAB_UNAVAILABLE', 'crontab', 'crontab NOT checked: "crontab -l" failed (exit ' . $rc . '): ' . trim($output));
+        return;
+    }
+
+    if (!is_array($CRONTAB_SIGS)) {
+        return;
+    }
+    foreach (explode("\n", $output) as $line) {
+        if ((trim($line) === "") || ((strlen($line) > 0) && ('#'==$line[0]))) {
+            continue;
+        }
+
+        foreach ($CRONTAB_SIGS as $item) {
+            foreach ($item as $name => $pattern) {
+                if (preg_match($pattern, $line)) {
+                    report_finding('HIGH', 'CRONTAB_IOC', 'crontab', $name . ': ' . $line);
+                    break 2;
                 }
             }
         }
@@ -553,13 +584,13 @@ function scanAccessLog($log_path, &$acc)
     //////////////
     $is_gzipped = ('gz' === strtolower(pathinfo($log_path, PATHINFO_EXTENSION)));
     if ($is_gzipped && !function_exists('gzopen')) {
-        progress('Error: zlib not available, skipping compressed log ' . $log_path . "\n");
+        report_finding('ERROR', 'LOG_UNREADABLE', $log_path, 'compressed log NOT scanned: PHP zlib extension not available (decompress it first, or scan from a host with zlib)');
         return;
     }
 
     $fh = $is_gzipped ? @gzopen($log_path, 'r') : @fopen($log_path, 'r');
     if (false === $fh) {
-        progress('Error reading ' . $log_path . "\n");
+        report_finding('ERROR', 'LOG_UNREADABLE', $log_path, 'log NOT scanned: cannot open it (permissions?)');
         return;
     }
 

@@ -51,6 +51,17 @@ $EW scanlog=/tmp/ew/access.log
 
 Expect: `HIGH,LOG_IOC,...access.uploads.php...`, two `MEDIUM,LOG_IOC` lines (env probe, code injection), example lines indented, and a top-source-IP list.
 
+**A5. Blocked checks are ERROR findings, not silent passes.**
+
+```sh
+php -d disable_functions=shell_exec elderward.php scancron=1; echo "exit=$?"
+$EW scancron=1; echo "exit=$?"
+mkdir -p /tmp/ew/logs && ln -sf /nonexistent/access.log.1.gz /tmp/ew/logs/access.log.1.gz && cp /tmp/ew/access.log /tmp/ew/logs/
+$EW scanlog=/tmp/ew/logs; echo "exit=$?"
+```
+
+Expect: the first command prints `ERROR,CRONTAB_UNAVAILABLE,crontab,crontab NOT checked: shell_exec is not available...` and exits 2. The second prints `No crontab for the current user.` (exit 0) when the user has none, the usual `CRONTAB_IOC` lines when it has malicious entries, or `CRONTAB_UNAVAILABLE` with the `crontab -l` error if the binary is missing. The directory log scan prints `ERROR,LOG_UNREADABLE,/tmp/ew/logs/access.log.1.gz,log NOT scanned: cannot open it (permissions?)` alongside the A4 findings (on a host without zlib a real `.gz` reports `compressed log NOT scanned: PHP zlib extension not available`); the exit code is 3 because of the HIGH log IoC.
+
 ---
 
 ## B. Integrity — live wordpress.org API ← the untested part
