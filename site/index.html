@@ -1,0 +1,1128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Elderward</title>
+<meta name="description" content="Elderward is a free, single-file PHP malware scanner for compromised WordPress sites. It removes known malware, verifies core, plugins and themes, and reads access logs to show how the attacker got in.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#061614">
+<meta property="og:title" content="Elderward">
+<meta property="og:description" content="A single PHP file that finds what crept into a WordPress site, and shows you how it got in.">
+<link rel="alternate" hreflang="en" href="https://elderward.space.fast/">
+<link rel="alternate" hreflang="pt-BR" href="https://elderward.space.fast/pt-br/">
+<link rel="alternate" hreflang="x-default" href="https://elderward.space.fast/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23061614'/%3E%3Cpath d='M16 3 23.6 26.5 3.6 12h24.8L8.4 26.5Z' fill='none' stroke='%23D9AE55' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='2.6' fill='%23D9AE55'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anonymous+Pro:ital,wght@0,400;0,700;1,400&family=IM+Fell+English:ital@0;1&display=swap" rel="stylesheet">
+<style>
+:root {
+  --abyss: #061614;
+  --brine: #0e2b27;
+  --kelp: #173d37;
+  --verdigris: #7dbfaa;
+  --verdigris-dim: #4f8676;
+  --bone: #dcd3b0;
+  --bone-dim: #a59e86;
+  --sigil: #d9ae55;
+  --ichor: #d2543f;
+  --rot: #b48cc8;
+
+  --serif: "IM Fell English", "Iowan Old Style", Georgia, serif;
+  --mono: "Anonymous Pro", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  --measure: 64ch;
+  --gutter: clamp(16px, 4vw, 56px);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { background: var(--abyss); }
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(ellipse 70% 55% at 72% 18%, rgba(23, 61, 55, .55), transparent 70%),
+    radial-gradient(ellipse 90% 60% at 10% 100%, rgba(14, 43, 39, .7), transparent 70%),
+    var(--abyss);
+  color: var(--bone);
+  font-family: var(--mono);
+  font-size: 1.125rem;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* faint CRT scanlines over everything; purely decorative */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(to bottom, rgba(0, 0, 0, .18) 0 1px, transparent 1px 3px);
+  mix-blend-mode: multiply;
+  z-index: 10;
+}
+
+a { color: var(--verdigris); text-underline-offset: .2em; text-decoration-thickness: 1px; }
+a:hover { color: var(--bone); }
+
+:focus-visible {
+  outline: 2px solid var(--sigil);
+  outline-offset: 3px;
+}
+
+pre {
+  scrollbar-width: thin;
+  scrollbar-color: var(--kelp) transparent;
+}
+
+code {
+  font-family: var(--mono);
+  color: var(--verdigris);
+}
+
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+}
+
+/* ---------- language switch ---------- */
+
+.lang {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 20px;
+  font-size: .95rem;
+}
+
+/* ---------- hero ---------- */
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: clamp(24px, 4vw, 64px);
+  align-items: center;
+  min-height: min(100vh, 920px);
+  padding-top: clamp(32px, 6vh, 72px);
+  padding-bottom: clamp(32px, 6vh, 72px);
+}
+
+.hero-text { position: relative; z-index: 1; }
+
+h1 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: clamp(4rem, 7.6vw, 8.5rem);
+  line-height: .86;
+  letter-spacing: -.02em;
+  margin: 0 0 .32em;
+  color: var(--bone);
+  text-shadow: 0 0 28px rgba(217, 174, 85, .18);
+}
+
+.lede {
+  font-size: clamp(1.15rem, 1.6vw, 1.35rem);
+  line-height: 1.5;
+  max-width: 34ch;
+  margin: 0 0 1.6em;
+}
+
+.ward {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1.02;
+}
+
+.ward canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  filter: drop-shadow(0 0 14px rgba(217, 174, 85, .22));
+}
+
+/* ---------- command block ---------- */
+
+.cmd {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--kelp);
+  background: rgba(6, 22, 20, .75);
+  max-width: 100%;
+}
+
+.cmd pre {
+  margin: 0;
+  padding: .85em 1em;
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: .95rem;
+  line-height: 1.6;
+  color: var(--bone);
+}
+
+.cmd pre .p { color: var(--verdigris-dim); user-select: none; }
+
+.copy {
+  flex: none;
+  font: inherit;
+  font-size: .9rem;
+  color: var(--verdigris);
+  background: transparent;
+  border: 0;
+  border-left: 1px solid var(--kelp);
+  padding: 0 1em;
+  cursor: pointer;
+}
+.copy:hover { background: var(--brine); color: var(--bone); }
+
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .6em 1.6em;
+  margin-top: 1.4em;
+}
+
+.links a { font-weight: 700; }
+
+/* ---------- sections ---------- */
+
+section { padding: clamp(56px, 9vw, 120px) 0 0; }
+
+h2 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: clamp(2.2rem, 4.4vw, 3.4rem);
+  line-height: 1.02;
+  margin: 0 0 .25em;
+  color: var(--bone);
+}
+
+.sub {
+  color: var(--bone-dim);
+  max-width: var(--measure);
+  margin: 0 0 2.2em;
+}
+
+/* ---------- terminal ---------- */
+
+.term {
+  border: 1px solid var(--kelp);
+  background: #030c0b;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .6), 0 30px 80px -30px rgba(0, 0, 0, .9);
+}
+
+.term-bar {
+  display: flex;
+  justify-content: space-between;
+  gap: 1em;
+  padding: .5em 1em;
+  border-bottom: 1px solid var(--kelp);
+  color: var(--verdigris-dim);
+  font-size: .85rem;
+}
+
+.term-bar button {
+  font: inherit;
+  color: var(--verdigris);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  white-space: nowrap;
+  text-decoration: underline;
+  text-underline-offset: .2em;
+}
+
+.term pre {
+  margin: 0;
+  padding: 1.1em 1.2em 1.3em;
+  min-height: 25.5em;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: .92rem;
+  line-height: 1.6;
+  color: var(--bone-dim);
+  white-space: pre;
+}
+
+.term .c { color: var(--bone); }
+.term .ctx { color: var(--verdigris-dim); }
+.term .HIGH { color: var(--ichor); font-weight: 700; }
+.term .MEDIUM { color: var(--sigil); font-weight: 700; }
+.term .LOW { color: var(--verdigris); font-weight: 700; }
+.term .INFO { color: var(--bone-dim); font-weight: 700; }
+.term .ERROR { color: var(--rot); font-weight: 700; }
+.term .cursor {
+  display: inline-block;
+  width: .6em;
+  height: 1.1em;
+  vertical-align: -.2em;
+  background: var(--verdigris);
+  animation: blink 1.1s steps(1) infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+/* ---------- modes ---------- */
+
+.modes {
+  margin: 0;
+  border-top: 1px solid var(--kelp);
+}
+
+.mode {
+  display: grid;
+  grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
+  gap: .4em 2.4em;
+  padding: 1.35em 0;
+  border-bottom: 1px solid var(--kelp);
+}
+
+.mode dt {
+  font-weight: 700;
+  color: var(--verdigris);
+  overflow-wrap: anywhere;
+}
+
+.mode dt .name {
+  display: block;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 1.45rem;
+  color: var(--bone);
+  line-height: 1.15;
+  margin-bottom: .15em;
+}
+
+.mode dd {
+  margin: 0;
+  max-width: var(--measure);
+}
+
+/* ---------- wards ---------- */
+
+.wards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 30ch), 1fr));
+  gap: 2.2em 3em;
+}
+
+.wards li {
+  position: relative;
+  padding-left: 2.1em;
+}
+
+/* elder-sign glyph as the list marker */
+.wards li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: .2em;
+  width: 1.15em;
+  height: 1.15em;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 3 23.6 26.5 3.6 12h24.8L8.4 26.5Z' fill='none' stroke='%23D9AE55' stroke-width='2.2'/%3E%3Ccircle cx='16' cy='16.4' r='2.4' fill='%23D9AE55'/%3E%3C/svg%3E") no-repeat center / contain;
+}
+
+.wards strong {
+  display: block;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 1.4rem;
+  line-height: 1.15;
+  color: var(--bone);
+  margin-bottom: .3em;
+}
+
+.wards p { margin: 0; color: var(--bone-dim); }
+
+/* ---------- output + exit codes ---------- */
+
+.formats {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2em 3em;
+  margin-bottom: 3.2em;
+}
+
+.formats p { margin: 0 0 1em; max-width: var(--measure); }
+
+.formats pre {
+  margin: 0;
+  padding: 1em 1.1em;
+  border: 1px solid var(--kelp);
+  background: #030c0b;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: .9rem;
+  line-height: 1.6;
+  color: var(--bone-dim);
+}
+
+h3 {
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 1.6rem;
+  line-height: 1.15;
+  margin: 0 0 .5em;
+}
+
+/* exit codes laid out like a sanity track on an investigator sheet */
+.track {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--bone-dim);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.track li {
+  padding: 1.1em 1.1em 1.3em;
+  border-left: 1px solid var(--bone-dim);
+}
+.track li:first-child { border-left: 0; }
+
+.track .n {
+  display: block;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 3.2rem;
+  line-height: 1;
+  margin-bottom: .2em;
+}
+
+.track li:nth-child(1) .n { color: var(--verdigris); }
+.track li:nth-child(2) .n { color: var(--rot); }
+.track li:nth-child(3) .n { color: var(--sigil); }
+.track li:nth-child(4) .n { color: var(--ichor); }
+
+.track p { margin: 0; color: var(--bone-dim); font-size: 1rem; }
+.track p b { color: var(--bone); font-weight: 700; }
+
+/* ---------- get it ---------- */
+
+.get {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2.4em 3em;
+}
+
+.get ul {
+  margin: 0;
+  padding-left: 1.2em;
+}
+.get li { margin-bottom: .7em; max-width: var(--measure); }
+.get li::marker { color: var(--sigil); }
+
+.get .cmd + .cmd { margin-top: .8em; }
+
+.warning {
+  margin-top: 1.6em;
+  padding: 1em 1.1em;
+  border-left: 3px solid var(--ichor);
+  background: rgba(210, 84, 63, .07);
+  max-width: var(--measure);
+}
+.warning p { margin: 0; }
+.warning p + p { margin-top: .6em; color: var(--bone-dim); }
+
+/* ---------- footer ---------- */
+
+footer {
+  margin-top: clamp(72px, 11vw, 150px);
+  padding: 3em 0 4em;
+  border-top: 1px solid var(--kelp);
+}
+
+.epigraph {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: clamp(1.6rem, 3.4vw, 2.6rem);
+  line-height: 1.2;
+  margin: 0 0 .4em;
+  max-width: 26ch;
+  color: var(--bone);
+}
+
+.epigraph-note {
+  color: var(--bone-dim);
+  margin: 0 0 2.4em;
+  max-width: var(--measure);
+}
+
+.foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 1em 2em;
+  color: var(--verdigris-dim);
+  font-size: .95rem;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 900px) {
+  .hero {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+  }
+  .ward { order: -1; max-width: 520px; margin: 0 auto; width: 100%; }
+  .formats, .get { grid-template-columns: minmax(0, 1fr); }
+  .mode { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 640px) {
+  body { font-size: 1.0625rem; }
+  .track { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .track li:nth-child(3) { border-left: 0; }
+  .track li:nth-child(n+3) { border-top: 1px solid var(--bone-dim); }
+  .term pre { font-size: .8rem; min-height: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .term .cursor { animation: none; }
+}
+</style>
+</head>
+<body>
+
+<main>
+  <div class="wrap">
+    <nav class="lang" aria-label="Language">
+      <a href="pt-br/" hreflang="pt-BR" lang="pt-BR">Ler em português</a>
+    </nav>
+    <header class="hero">
+      <div class="hero-text">
+        <h1>Elderward</h1>
+        <p class="lede">A single PHP file that finds what crept into a WordPress site, cuts out the malware it knows, and reads the access logs to show you how it got in.</p>
+
+        <div class="cmd">
+          <pre id="cmd-hero"><span class="p">$ </span>curl -O https://raw.githubusercontent.com/fioa8c/elderward/main/elderward.php
+<span class="p">$ </span>php elderward.php scanall=1 scandirectory=/path/to/wp-root</pre>
+          <button class="copy" type="button" data-copy="cmd-hero">Copy</button>
+        </div>
+
+        <p class="links">
+          <a href="https://github.com/fioa8c/elderward">Read the source on GitHub</a>
+          <a href="https://raw.githubusercontent.com/fioa8c/elderward/main/elderward.php">View elderward.php source</a>
+        </p>
+      </div>
+
+      <div class="ward" aria-hidden="true">
+        <canvas id="ward"></canvas>
+      </div>
+    </header>
+
+    <section aria-labelledby="h-first-look">
+      <h2 id="h-first-look">A first look at a compromised host</h2>
+      <p class="sub"><code>scanall=1</code> runs every scanner without changing anything and prints one list, worst first. The exit code tells cron and CI how bad it is.</p>
+
+      <div class="term">
+        <div class="term-bar">
+          <span>investigator@host: /var/www/html</span>
+          <button type="button" id="replay">Run again</button>
+        </div>
+        <pre id="term" aria-label="Example elderward output"></pre>
+      </div>
+    </section>
+
+    <section aria-labelledby="h-modes">
+      <h2 id="h-modes">Seven ways to look</h2>
+      <p class="sub">Each scan mode is one flag. They run on their own, except <code>scanall</code>, which runs them all, and can pull in your logs too.</p>
+
+      <dl class="modes">
+        <div class="mode">
+          <dt><span class="name">Signature cleanup</span>php elderward.php</dt>
+          <dd>Walks the tree and matches known injections, including the <code>ndsw</code>/<code>ndsx</code> and <code>wqpq</code> JavaScript campaigns, then removes them. Add <code>dryrun=1</code> to see what would change first.</dd>
+        </div>
+        <div class="mode">
+          <dt><span class="name">Everything, report-only</span>scanall=1</dt>
+          <dd>Every scanner in one pass, sorted worst first. The signature pass is forced into dry run and <code>restore=1</code> is ignored, so nothing on disk changes.</dd>
+        </div>
+        <div class="mode">
+          <dt><span class="name">Integrity</span>scanintegrity=1</dt>
+          <dd>Checks WordPress core, every plugin and every theme against the official wordpress.org package for the installed version. Reports modified, missing and extra files. Extra PHP inside core or a plugin is the classic dropped webshell. Works offline with <code>checksumdir=</code>.</dd>
+        </div>
+        <div class="mode">
+          <dt><span class="name">Access logs</span>scanlog=/var/log/apache2</dt>
+          <dd>Reads every access log in a directory, <code>.gz</code> included, for webshell requests, PHP served from uploads, wp-file-manager, Slider Revolution and TimThumb exploits, <code>.env</code> probes, traversal, and xmlrpc or wp-login floods. Add <code>correlate=1</code> to find files modified within minutes of flagged traffic.</dd>
+        </div>
+        <div class="mode">
+          <dt><span class="name">Quick checks</span>quickscan=1</dt>
+          <dd>The cheap places attackers hide: executable PHP in <code>wp-content/uploads</code>, <code>auto_prepend_file</code> hooks in <code>.user.ini</code> and <code>.htaccess</code>, mu-plugins that load with no activation step, and hidden dotfile PHP.</dd>
+        </div>
+        <div class="mode">
+          <dt><span class="name">Timestamps</span>scantimes=1</dt>
+          <dd>Files changed after the rest of their package, and PHP whose modified time was pushed back with <code>touch</code> while the inode change time stayed put. These are leads, not proof.</dd>
+        </div>
+        <div class="mode">
+          <dt><span class="name">Crontab</span>scancron=1</dt>
+          <dd>The current user's crontab, checked for persistence: piped base64 decoders, pastebin downloads and droppers in tmp directories.</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section aria-labelledby="h-wards">
+      <h2 id="h-wards">Wards it will not break</h2>
+      <p class="sub">It runs on hosts that are already compromised, so it treats every filename, log line and API response as hostile.</p>
+
+      <ul class="wards">
+        <li>
+          <strong>A dry run stays dry</strong>
+          <p><code>dryrun=1</code> covers every write, delete and restore. It reports what it would do and leaves the disk alone.</p>
+        </li>
+        <li>
+          <strong>Restores are verified first</strong>
+          <p>Each file from the official zip is checked byte for byte against the reference checksums before it's written. A tampered package is refused.</p>
+        </li>
+        <li>
+          <strong>Unknown files are never deleted</strong>
+          <p>Extra files are reported, and deleting them is your call. Set <code>quarantinedir=</code> to keep each original aside as evidence before it's overwritten.</p>
+        </li>
+        <li>
+          <strong>Writes can't truncate</strong>
+          <p>Cleaned files go to a temp file and are renamed into place, so a failed write leaves the original intact.</p>
+        </li>
+        <li>
+          <strong>TLS verification stays on</strong>
+          <p>An "all clean" answer must never come from an attacker sitting between the host and wordpress.org.</p>
+        </li>
+        <li>
+          <strong>Hunches never touch disk</strong>
+          <p>Timestamp and log-correlation findings are leads for you to follow. They never trigger a cleanup or a restore.</p>
+        </li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="h-output">
+      <h2 id="h-output">Output you can pipe</h2>
+      <p class="sub">One line per finding, the same shape from every scanner, ready for grep, jq and tickets.</p>
+
+      <div class="formats">
+        <div>
+          <h3>Text</h3>
+          <p>The first three fields never contain commas. Paths and log content come from the compromised host, so control characters and commas in paths are percent-encoded. A crafted filename can't forge a finding line.</p>
+          <pre>SEVERITY,TYPE,path,detail</pre>
+        </div>
+        <div>
+          <h3>JSON</h3>
+          <p><code>format=json</code> prints one event per line on stdout and moves progress to stderr, so stdout stays machine-readable.</p>
+          <pre>{"event":"finding","severity":"HIGH",
+ "type":"LOG_IOC","path":"...","detail":"..."}</pre>
+        </div>
+      </div>
+
+      <h3>What the exit code tells you</h3>
+      <ol class="track">
+        <li><span class="n">0</span><p><b>Clean</b>, or informational findings only.</p></li>
+        <li><span class="n">1</span><p><b>Usage or fatal error.</b> Check the arguments.</p></li>
+        <li><span class="n">2</span><p><b>LOW, MEDIUM or ERROR</b> findings to review.</p></li>
+        <li><span class="n">3</span><p><b>HIGH findings.</b> A successful cleanup exits 3 too: malware was found.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="h-get">
+      <h2 id="h-get">Bring it to the host</h2>
+      <p class="sub">No dependencies and no build step. Copy one file and run it.</p>
+
+      <div class="get">
+        <div>
+          <ul>
+            <li>PHP 5.6 or newer. The zlib extension is only needed for <code>.gz</code> logs, and zip only for theme checks and restores.</li>
+            <li>Shell access, or the ability to upload a PHP file and reach it over HTTP.</li>
+            <li>No shell? Set a long random <code>WEB_ACCESS_TOKEN</code> at the top of the file, pass it as <code>?token=</code>, and delete the file when you're done.</li>
+          </ul>
+          <div class="warning">
+            <p>Take a backup before cleaning. Preview with <code>dryrun=1</code>.</p>
+            <p>It finds known malware. A clean scan is not proof of a clean site, and log hits include plenty of attempts that failed.</p>
+          </div>
+        </div>
+        <div>
+          <div class="cmd">
+            <pre id="cmd-dry"><span class="p">$ </span>php elderward.php dryrun=1 scandirectory=/path/to/site</pre>
+            <button class="copy" type="button" data-copy="cmd-dry">Copy</button>
+          </div>
+          <div class="cmd">
+            <pre id="cmd-logs"><span class="p">$ </span>php elderward.php scanlog=/var/log/apache2 correlate=1 scandirectory=/path/to/wp-root</pre>
+            <button class="copy" type="button" data-copy="cmd-logs">Copy</button>
+          </div>
+          <div class="cmd">
+            <pre id="cmd-restore"><span class="p">$ </span>php elderward.php scanintegrity=1 restore=1 quarantinedir=/safe/place scandirectory=/path/to/wp-root</pre>
+            <button class="copy" type="button" data-copy="cmd-restore">Copy</button>
+          </div>
+          <div class="cmd">
+            <pre id="cmd-help"><span class="p">$ </span>php elderward.php help=1</pre>
+            <button class="copy" type="button" data-copy="cmd-help">Copy</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="h-samples">
+      <h2 id="h-samples">Send what it missed</h2>
+      <p class="sub">Elderward only knows malware someone has already caught. If you clean a site and find something it didn't flag, open a GitHub issue with a sample so the next scan catches it.</p>
+
+      <div class="get">
+        <div>
+          <h3>Put this in the issue</h3>
+          <ul>
+            <li>The file, zipped with the password <code>infected</code> so antivirus and GitHub don't strip it. GitHub won't take a bare <code>.php</code> attachment.</li>
+            <li>Its SHA-256 hash, and the path where you found it.</li>
+            <li>How it was loaded: an include in <code>functions.php</code>, an mu-plugin, a cron entry, <code>auto_prepend_file</code>, or something else.</li>
+            <li>The WordPress, plugin and theme versions, if you have them.</li>
+            <li>For attack traffic, the matching access log lines.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Package the sample</h3>
+          <div class="cmd">
+            <pre id="cmd-hash"><span class="p">$ </span>shasum -a 256 suspicious.php</pre>
+            <button class="copy" type="button" data-copy="cmd-hash">Copy</button>
+          </div>
+          <div class="cmd">
+            <pre id="cmd-zip"><span class="p">$ </span>zip -j -P infected sample.zip suspicious.php</pre>
+            <button class="copy" type="button" data-copy="cmd-zip">Copy</button>
+          </div>
+          <div class="warning">
+            <p>Issues are public. Remove anything that identifies the site before you upload.</p>
+            <p>That means domain names, database credentials, salts, email addresses and visitor IPs in log lines. Never attach <code>wp-config.php</code> or a database dump.</p>
+          </div>
+          <p class="links">
+            <a href="https://github.com/fioa8c/elderward/issues/new">Open an issue on GitHub</a>
+            <a href="https://github.com/fioa8c/elderward/issues">Search existing issues</a>
+          </p>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p class="epigraph">That is not dead which can eternal lie.</p>
+    <p class="epigraph-note">H. P. Lovecraft wrote it about the Old Ones. It holds for a backdoor in an mu-plugin, too.</p>
+    <div class="foot">
+      <span>Elderward is free, and a variation of the Jetpack Cleanup Util.</span>
+      <a href="https://github.com/fioa8c/elderward">github.com/fioa8c/elderward</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  // UI strings the script writes; the page's lang picks the set
+  var L = document.documentElement.lang === "pt-BR"
+    ? { copy: "Copiar", copied: "Copiado", select: "Selecione o texto" }
+    : { copy: "Copy", copied: "Copied", select: "Select it" };
+
+  var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  //////////////
+  // Copy buttons
+  //////////////
+  Array.prototype.forEach.call(document.querySelectorAll("[data-copy]"), function (btn) {
+    btn.addEventListener("click", function () {
+      var pre = document.getElementById(btn.getAttribute("data-copy"));
+      var text = pre.textContent.replace(/^\$ /gm, "");
+      var done = function () {
+        btn.textContent = L.copied;
+        setTimeout(function () { btn.textContent = L.copy; }, 1600);
+      };
+      try {
+        navigator.clipboard.writeText(text).then(done, function () { btn.textContent = L.select; });
+      } catch (e) {
+        btn.textContent = L.select;
+      }
+    });
+  });
+
+  //////////////
+  // The ward: an Elder Sign gripped by tentacles, written in the
+  // fragments of malware elderward hunts for.
+  //////////////
+  var CODE = (
+    "if(typeof ndsw===undefined){var ndsw=true;" +
+    "eval(gzinflate(base64_decode($_POST['x'])));" +
+    "if(typeof wqpq===undefined)" +
+    "auto_prepend_file=/tmp/.x.php;" +
+    "*****echo|base64--decode>/tmp/.sess;" +
+    "/wp-content/uploads/2024/03/cache.php" +
+    "wso.php?FilesMan;alfa-rex;b374k;c99;r57;" +
+    "../../../../etc/passwd;/.env;xmlrpc.php;" +
+    "assert($_REQUEST['cmd']);preg_replace('/.*/e');"
+  ).replace(/\s+/g, "");
+  var NOISE = ".:;'`-~^,";
+
+  var canvas = document.getElementById("ward");
+  var ctx = canvas.getContext("2d");
+  var cells = [];
+  var cols = 0, rows = 0, cellW = 0, cellH = 0, fontPx = 0, W = 0, H = 0;
+  var startTime = 0, settled = false, running = false, visible = true, lastIdle = 0;
+
+  var COLORS = {
+    star: [217, 174, 85],
+    ring: [220, 211, 176],
+    tent: [125, 191, 170],
+    noise: [79, 134, 118]
+  };
+  var BG = { star: 0.22, ring: 0.16, tent: 0.2, noise: 0 };
+
+  function bezier(p0, p1, p2, p3, t) {
+    var u = 1 - t;
+    return [
+      u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+      u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1]
+    ];
+  }
+
+  function drawMask(m) {
+    var cx = W / 2, cy = H * 0.45, R = Math.min(W, H) * 0.34;
+    m.clearRect(0, 0, W, H);
+    m.globalCompositeOperation = "lighter";
+    m.lineCap = "round";
+    m.lineJoin = "round";
+
+    // tentacles (blue channel): chains of bezier segments, tapering from
+    // base to a curled tip
+    var T = [
+      [3.8, [[-0.05, 1.04], [-0.02, 0.62], [-0.02, 0.2], [0.16, 0.08]], [[0.16, 0.08], [0.26, 0.02], [0.31, 0.12], [0.24, 0.15]]],
+      [3.8, [[1.05, 1.04], [1.03, 0.7], [1.03, 0.36], [0.9, 0.2]], [[0.9, 0.2], [0.82, 0.1], [0.74, 0.16], [0.8, 0.21]]],
+      [3.0, [[0.24, 1.08], [0.3, 0.9], [0.02, 0.9], [0.06, 0.66]], [[0.06, 0.66], [0.08, 0.56], [0.17, 0.6], [0.14, 0.65]]],
+      [3.0, [[0.78, 1.08], [0.7, 0.9], [0.99, 0.92], [0.95, 0.7]], [[0.95, 0.7], [0.93, 0.62], [0.85, 0.64], [0.88, 0.69]]],
+      [2.4, [[0.47, 1.1], [0.4, 0.98], [0.6, 0.96], [0.56, 0.87]]]
+    ];
+    m.strokeStyle = "rgb(0,0,255)";
+    T.forEach(function (t) {
+      var segs = t.slice(1), steps = 36, total = segs.length * steps, n = 0;
+      segs.forEach(function (seg) {
+        var q = seg.map(function (pt) { return [pt[0] * W, pt[1] * H]; });
+        var prev = bezier(q[0], q[1], q[2], q[3], 0);
+        for (var i = 1; i <= steps; i++) {
+          var pt = bezier(q[0], q[1], q[2], q[3], i / steps);
+          m.lineWidth = cellW * t[0] * (1 - (++n / total) * 0.8);
+          m.beginPath();
+          m.moveTo(prev[0], prev[1]);
+          m.lineTo(pt[0], pt[1]);
+          m.stroke();
+          prev = pt;
+        }
+      });
+    });
+
+    // warding circles (red channel)
+    m.strokeStyle = "rgb(255,0,0)";
+    m.lineWidth = cellH * 0.55;
+    m.beginPath(); m.arc(cx, cy, R * 1.1, 0, Math.PI * 2); m.stroke();
+
+    // pentagram and eye (green channel)
+    m.strokeStyle = "rgb(0,255,0)";
+    m.fillStyle = "rgb(0,255,0)";
+    m.lineWidth = cellW * 1.25;
+    var pts = [];
+    for (var k = 0; k < 5; k++) {
+      var a = -Math.PI / 2 + k * Math.PI * 2 / 5;
+      pts.push([cx + R * 1.08 * Math.cos(a), cy + R * 1.08 * Math.sin(a)]);
+    }
+    m.beginPath();
+    m.moveTo(pts[0][0], pts[0][1]);
+    [2, 4, 1, 3].forEach(function (i) { m.lineTo(pts[i][0], pts[i][1]); });
+    m.closePath();
+    m.stroke();
+
+    var ey = cy + R * 0.03, ew = R * 0.3, eh = R * 0.15;
+    m.lineWidth = cellW * 1.3;
+    m.beginPath();
+    m.moveTo(cx - ew, ey);
+    m.quadraticCurveTo(cx, ey - eh * 2, cx + ew, ey);
+    m.quadraticCurveTo(cx, ey + eh * 2, cx - ew, ey);
+    m.stroke();
+    m.beginPath(); m.arc(cx, ey, eh * 0.85, 0, Math.PI * 2); m.fill();
+
+    // the flame rising from the eye
+    m.lineWidth = cellW * 1.1;
+    m.beginPath();
+    m.moveTo(cx, ey - eh * 1.15);
+    m.bezierCurveTo(cx - ew * 0.35, ey - R * 0.3, cx + ew * 0.3, ey - R * 0.38, cx, ey - R * 0.55);
+    m.stroke();
+    m.globalCompositeOperation = "source-over";
+  }
+
+  function build() {
+    var rect = canvas.getBoundingClientRect();
+    W = Math.max(200, Math.round(rect.width));
+    H = Math.max(200, Math.round(rect.height));
+    var dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    cols = W < 420 ? 52 : 70;
+    ctx.font = "700 100px " + getComputedStyle(document.body).getPropertyValue("--mono");
+    var ratio = ctx.measureText("M").width / 100 || 0.55;
+    cellW = W / cols;
+    fontPx = cellW / ratio;
+    cellH = fontPx * 1.02;
+    rows = Math.floor(H / cellH);
+
+    var off = document.createElement("canvas");
+    off.width = W; off.height = H;
+    var m = off.getContext("2d");
+    drawMask(m);
+    var data = m.getImageData(0, 0, W, H).data;
+
+    cells = [];
+    var cx = cols / 2, cy = rows * 0.45, maxD = Math.sqrt(cx * cx + cy * cy);
+    var ci = 0;
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        var sum = [0, 0, 0], n = 0;
+        for (var sy = 0; sy < 3; sy++) {
+          for (var sx = 0; sx < 3; sx++) {
+            var px = Math.min(W - 1, Math.floor((c + (sx + 0.5) / 3) * cellW));
+            var py = Math.min(H - 1, Math.floor((r + (sy + 0.5) / 3) * cellH));
+            var idx = (py * W + px) * 4;
+            sum[0] += data[idx]; sum[1] += data[idx + 1]; sum[2] += data[idx + 2]; n++;
+          }
+        }
+        var red = sum[0] / n / 255, green = sum[1] / n / 255, blue = sum[2] / n / 255;
+        var kind = null, cov = 0;
+        if (green > 0.22) { kind = "star"; cov = green; }
+        else if (red > 0.22) { kind = "ring"; cov = red; }
+        else if (blue > 0.22) { kind = "tent"; cov = blue; }
+        else if (Math.random() < 0.02) { kind = "noise"; cov = 0.3; }
+        if (!kind) continue;
+
+        var ch = kind === "noise" ? NOISE.charAt(Math.floor(Math.random() * NOISE.length)) : CODE.charAt(ci++ % CODE.length);
+        var dx = c - cx, dy = (r - cy) * 2;
+        cells.push({
+          x: c * cellW,
+          y: r * cellH,
+          ch: ch,
+          kind: kind,
+          a: kind === "noise" ? 0.45 : 0.42 + 0.58 * Math.min(1, cov),
+          // kindles outward from the eye
+          t: (Math.sqrt(dx * dx + dy * dy) / maxD) * 1500 + Math.random() * 450,
+          flick: 0
+        });
+      }
+    }
+  }
+
+  function render(now) {
+    var elapsed = now - startTime;
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = "700 " + fontPx.toFixed(2) + "px " + getComputedStyle(document.body).getPropertyValue("--mono");
+    ctx.textBaseline = "top";
+    var allDone = true;
+    for (var i = 0; i < cells.length; i++) {
+      var cell = cells[i], col = COLORS[cell.kind], ch = cell.ch, a = cell.a;
+      if (elapsed < cell.t) {
+        allDone = false;
+        if (elapsed < cell.t - 500) continue;
+        ch = CODE.charAt(Math.floor(Math.random() * CODE.length));
+        a *= 0.35;
+      } else if (cell.flick > now) {
+        ch = CODE.charAt(Math.floor(Math.random() * CODE.length));
+        a = Math.min(1, a + 0.3);
+      }
+      var rgb = col[0] + "," + col[1] + "," + col[2];
+      // inverse-video tint behind each glyph so the sign reads as a shape
+      if (BG[cell.kind] && elapsed >= cell.t) {
+        ctx.fillStyle = "rgba(" + rgb + "," + (BG[cell.kind] * cell.a).toFixed(3) + ")";
+        ctx.fillRect(cell.x, cell.y, cellW + 0.4, cellH + 0.4);
+      }
+      ctx.fillStyle = "rgba(" + rgb + "," + a.toFixed(2) + ")";
+      ctx.fillText(ch, cell.x, cell.y);
+    }
+    return allDone;
+  }
+
+  function frame(now) {
+    if (!visible) { running = false; return; }
+    if (!settled) {
+      settled = render(now);
+    } else if (now - lastIdle > 110) {
+      lastIdle = now;
+      // a few glyphs stir; the noise drifts
+      for (var k = 0; k < 4; k++) {
+        var c = cells[Math.floor(Math.random() * cells.length)];
+        if (c) c.flick = now + 160 + Math.random() * 260;
+        var nz = cells[Math.floor(Math.random() * cells.length)];
+        if (nz && nz.kind === "noise") nz.ch = NOISE.charAt(Math.floor(Math.random() * NOISE.length));
+      }
+      render(now);
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function start() {
+    if (reduceMotion) {
+      render(startTime + 1e9);
+      return;
+    }
+    if (!running) {
+      running = true;
+      requestAnimationFrame(frame);
+    }
+  }
+
+  function init() {
+    build();
+    startTime = performance.now();
+    settled = false;
+    start();
+  }
+
+  var resizeTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      build();
+      settled = false;
+      startTime = performance.now() - 1e9;
+      if (reduceMotion) { render(startTime + 2e9); } else { start(); }
+    }, 150);
+  });
+
+  if ("IntersectionObserver" in window) {
+    new IntersectionObserver(function (entries) {
+      visible = entries[0].isIntersecting;
+      if (visible && !reduceMotion) start();
+    }).observe(canvas);
+  }
+
+  var fontsReady = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+  fontsReady.then(init, init);
+
+  //////////////
+  // The terminal: a scanall run, typed once when it scrolls into view
+  //////////////
+  var LINES = [
+    { cmd: "php elderward.php scanall=1 scanlog=/var/log/apache2 scandirectory=/var/www/html" },
+    { sev: "HIGH", rest: ",UPLOADS_PHP,/var/www/html/wp-content/uploads/2024/03/cache.php,executable PHP inside wp-content/uploads - usually a webshell dropped through an upload form" },
+    { sev: "HIGH", rest: ",INTEGRITY_EXTRA,/var/www/html/wp-includes/class-wp-locale-switch.php,core 6.6.2: file is not part of the official package" },
+    { sev: "HIGH", rest: ",INTEGRITY_MODIFIED,/var/www/html/wp-content/plugins/akismet/akismet.php,plugin akismet 5.3.3: checksum does not match the official package" },
+    { sev: "HIGH", rest: ",MALWARE_FOUND,/var/www/html/wp-includes/js/jquery/jquery-migrate.min.js,javascript_ndsw (dry run: file not modified)" },
+    { sev: "HIGH", rest: ",CRONTAB_IOC,crontab,crontab.tmp.006: * * * * * echo ... | base64 --decode > /tmp/x" },
+    { sev: "HIGH", rest: ",LOG_IOC,/var/log/apache2/access.log,access.uploads.php: 37 hit(s) - PHP file requested inside wp-content/uploads." },
+    { ctx: "    e.g. 203.0.113.66 - - [12/Mar/2024:03:14:07 +0000] \"POST /wp-content/uploads/2024/03/cache.php HTTP/1.1\" 200" },
+    { sev: "MEDIUM", rest: ",LOG_IOC,/var/log/apache2/access.log.2.gz,access.xmlrpc.flood: 4182 hit(s) - High volume of xmlrpc.php POSTs, typically credential brute forcing via system.multicall or pingback abuse." },
+    { sev: "MEDIUM", rest: ",TIMESTAMP_OUTLIER,/var/www/html/wp-content/themes/astra/functions.php,theme astra: modified 2024-03-12 03:15 but 412 of 418 files cluster around 2024-01-08 10:02" },
+    { sev: "LOW", rest: ",INTEGRITY_MISSING,/var/www/html/wp-admin/css/about.min.css,core 6.6.2: file from the official package is missing" },
+    { sev: "INFO", rest: ",MU_PLUGIN,/var/www/html/wp-content/mu-plugins/loader.php,must-use plugin: loads on every request with no activation step - confirm it is intentional" },
+    { cmd: "echo $?" },
+    { out: "3" }
+  ];
+
+  var term = document.getElementById("term");
+  var termTimers = [];
+
+  function clearTerm() {
+    termTimers.forEach(clearTimeout);
+    termTimers = [];
+    while (term.firstChild) term.removeChild(term.firstChild);
+  }
+
+  function span(cls, text) {
+    var s = document.createElement("span");
+    if (cls) s.className = cls;
+    s.textContent = text;
+    return s;
+  }
+
+  function appendLine(line, typed) {
+    var row = document.createDocumentFragment();
+    if (line.cmd !== undefined) {
+      row.appendChild(span("ctx", "$ "));
+      row.appendChild(span("c", typed === undefined ? line.cmd : typed));
+    } else if (line.sev) {
+      row.appendChild(span(line.sev, line.sev));
+      row.appendChild(span("", line.rest));
+    } else if (line.ctx) {
+      row.appendChild(span("ctx", line.ctx));
+    } else {
+      row.appendChild(span("c", line.out));
+    }
+    term.appendChild(row);
+    term.appendChild(document.createTextNode("\n"));
+  }
+
+  function showAll() {
+    clearTerm();
+    LINES.forEach(function (l) { appendLine(l); });
+    term.appendChild(span("ctx", "$ "));
+  }
+
+  function play() {
+    clearTerm();
+    var at = 200;
+    var cursor = span("cursor", "");
+    LINES.forEach(function (line) {
+      if (line.cmd !== undefined) {
+        var target = null;
+        termTimers.push(setTimeout(function () {
+          term.appendChild(span("ctx", "$ "));
+          target = span("c", "");
+          term.appendChild(target);
+          term.appendChild(cursor);
+        }, at));
+        for (var i = 1; i <= line.cmd.length; i++) {
+          (function (n) {
+            termTimers.push(setTimeout(function () { target.textContent = line.cmd.slice(0, n); }, at + n * 24));
+          })(i);
+        }
+        at += line.cmd.length * 24 + 380;
+        termTimers.push(setTimeout(function () {
+          if (cursor.parentNode) cursor.parentNode.removeChild(cursor);
+          term.appendChild(document.createTextNode("\n"));
+        }, at));
+        at += line.cmd === "echo $?" ? 120 : 900;
+      } else {
+        termTimers.push(setTimeout(function () { appendLine(line); }, at));
+        at += 150 + Math.random() * 120;
+      }
+    });
+    termTimers.push(setTimeout(function () {
+      term.appendChild(span("ctx", "$ "));
+      term.appendChild(cursor);
+    }, at + 200));
+  }
+
+  document.getElementById("replay").addEventListener("click", function () {
+    if (reduceMotion) { showAll(); } else { play(); }
+  });
+
+  if (reduceMotion || !("IntersectionObserver" in window)) {
+    showAll();
+  } else {
+    var played = false;
+    new IntersectionObserver(function (entries, obs) {
+      if (entries[0].isIntersecting && !played) {
+        played = true;
+        obs.disconnect();
+        play();
+      }
+    }, { threshold: 0.35 }).observe(term);
+  }
+})();
+</script>
+</body>
+</html>
