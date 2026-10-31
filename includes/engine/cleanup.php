@@ -69,7 +69,7 @@ class SignatureScanner extends Scanner
             if (!is_scannable_file($this->ctx, $file)) {
                 continue;
             }
-            fwrite($fh, base64_encode($file->getPathname()) . "\n");
+            fwrite($fh, base64_encode($file->getPathname()) . "\n"); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- one path per line, whatever bytes the filename holds.
         }
         fclose($fh);
 
@@ -99,7 +99,7 @@ class SignatureScanner extends Scanner
             if (false === $line) {
                 break;
             }
-            $target_file = base64_decode(rtrim($line, "\n"), true);
+            $target_file = base64_decode(rtrim($line, "\n"), true); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode -- see collect().
             if (!is_string($target_file) || '' === $target_file) {
                 continue;
             }
